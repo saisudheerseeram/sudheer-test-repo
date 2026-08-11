@@ -354,6 +354,37 @@ only as a test-fixture site for C7/C8.
 
 ---
 
+## 4.5 Backward Compatibility (D1–D6, C1–C10)
+
+Every item is **API/contract compatible by design** — no signature, schema or response-shape
+breaks. Where "behavior" is flagged below, the change intentionally alters *which trace-key
+value gets stamped* (that is the point of the program). Any key-value change causes a
+**one-time Error Management dedup/auto-resolve discontinuity** for in-flight errors across the
+deploy boundary — transient, per affected export, not an ongoing break. During rolling deploys
+of integrator-workers, old and new pods briefly coexist, so intra-rollout key skew is expected
+and transient (the D6 identical-pins rule covers cross-service skew, not this window).
+
+| Item | Backward compatible? | Note |
+|---|---|---|
+| D1 | **Yes (API)** — key-value drift for NetSuite/Zendesk | Dual-key release window (`template` + `templates`). Activating previously dead map templates can change stamped values → one-time EM discontinuity for those connectors |
+| D2 | **Yes** | Internal unwrap; error path still returns null; adds aggregated telemetry only |
+| D3 | **Yes (API)** — key drift for CF2 exports | CF2 connections inherit map profiles that may outrank the dictionary field they matched before; mostly fills nulls |
+| D4 | **Yes** | Preview-only; production stamping untouched; response shape unchanged — keys just start appearing where production already had them |
+| D5 | **Yes** | Internal cache swap; LRU/TTL eviction may occasionally re-log a flow that was previously logged once |
+| D6 | **Yes** | Release-process change only |
+| C1 | **Yes (API)** — mostly null → value | Drift only where a record matched a dictionary field that the new map profile now outranks |
+| C2 | **Yes** | Null → value for misclassified Shopify/Amazon exports; anchored hostname rules prevent misclassification; never overrides an explicit assistant |
+| C3 | **Yes (API)** — key drift for a subset | Extracted Handlebars fields go first, so exports whose records previously matched URI nouns/dictionary can change key value |
+| C4 | **Yes** | Fallback names appended last and gated by C6 — fills nulls only |
+| C5 | **Yes (API additive)** | New module; batch selection can pick a different field than today's first-match-wins — mitigated by mandatory shadow mode before stamping |
+| C6 | **Yes (API additive)** — value → null possible | The gate can reject a field that today stamps duplicates; inferred keys only, user templates exempt, shadow mode before enforcement |
+| C7 | **Yes** | Mostly null → value; resourcePath handling may change keys for a small GraphQL subset |
+| C8 | **Yes, with one guard** | The trace-key-only `data` alias must bind **only when the record has no real `data` property** — never shadow an actual field |
+| C9 | **Yes** | Noise words drop out of candidates; keys change only where a noise word previously (wrongly) matched |
+| C10 | **Yes** | `getTraceKey` keeps string/null and delegates to the new result API; preview gains additive fields old UIs ignore; no sentinel values stamped |
+
+---
+
 ## 5. Release Plan — Phases in Shipping Order
 
 | Step | Phase | Risk | Ship | Notes |
