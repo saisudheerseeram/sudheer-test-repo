@@ -61,17 +61,17 @@ D1–D6 are **not** part of the ten proposed changes. They are existing bugs dis
 | # | Title | Status | Size | Phase | Primary owner | Primary locations |
 |---:|---|---|---|---:|---|---|
 | 1 | Expand assistant map | Proceed after D1 | M | 2 | integrator-common-util | map.js, patternFinder.js, main.js |
-| 2 | Detect Shopify/Amazon HTTP | Rework | S | 2 | integrator-common-util | patternFinder.js, connection.js, map.js |
+| 2 | Detect Shopify/Amazon HTTP | Rework | M | 2 | integrator-common-util | patternFinder.js, connection.js, map.js |
 | 3 | Extract Handlebars from URI | Proceed | S | 1 | integrator-common-util | patternFinder.js:274–311 |
-| 4 | Widen identifier fallbacks | HTTP-scope | S | 4 | integrator-common-util | patternFinder.js:274–311 |
-| 5 | Response-batch inference | Framework | M/L | 4 | common-util + adaptor + endpoint/UI only | tracekey-common, exportDataConverter, abstractExport, endpoint |
-| 6 | Pre-stamp uniqueness gate | With Change 5 | M | 4 | common-util + adaptor + endpoint/UI only | tracekey-common, adaptor, endpoint, UI |
+| 4 | Widen identifier fallbacks | HTTP-scope | M | 4 | integrator-common-util | patternFinder.js:274–311 |
+| 5 | Response-batch inference | Framework | XL | 4 | common-util + adaptor + flow-execution + endpoint/UI | tracekey-common, exportDataConverter, abstractExport, injectTraceKeys (flow-execution), endpoint |
+| 6 | Pre-stamp uniqueness gate | With Change 5 | L | 4 | common-util + adaptor + flow-execution + endpoint/UI | tracekey-common, adaptor, injectTraceKeys (flow-execution), endpoint, UI |
 | 7 | GraphQL support | Proceed | M | 3 | integrator-common-util | connection.js, patternFinder.js, main.js |
 | 8 | CF2/template divergence | Needs samples | M | 3 | common-util + endpoint | main.js, baseHBDelegate.js, endpoint |
 | 9 | Reduce noisy URI segments | Proceed | S | 1 | integrator-common-util | patternFinder.js:286–309 |
 | 10 | Explicit no-reliable-key state | Proceed | L | 4 | common-util + adaptor + FE + endpoint/UI | main.js, abstractAdaptor, qgmw, endpoint, UI |
 
-*Size legend: size = total effort (research, validation, tests, rollout) — not diff size. Sizes recalibrated after external review: Changes 1, 7 and 8 carry real research/sampling effort beyond their small diffs (M); Change 10 spans a five-repo API and UI propagation (L); Changes 5 and 6 remain the largest framework builds.*
+*Size legend (tracker scale S/M/L/XL, one value per change): size = total effort — research, validation, tests, rollout — not diff size. Final sizing after two review rounds: C3, C9 = S (small, ready code changes); C1, C2, C4, C7, C8 = M (real research/sampling/validation effort beyond small diffs); C6, C10 = L (multi-repo contract and propagation work); C5 = XL (new cross-repo batch-inference framework).*
 
 ### Key Caveats
 
@@ -126,9 +126,10 @@ D1–D6 are **not** part of the ten proposed changes. They are existing bugs dis
 
 | # | Step |
 |---:|---|
-| 1 | Replace the last-segment prefix logic (patternFinder.js:294–297) with an all-segment extractor: `/\{\{\s*(?:record|data)\.([A-Za-z0-9_.]+)\s*\}\}/g`; take the leaf name; skip helpers/complex expressions |
-| 2 | Candidate order: extracted fields first, then URI nouns, then dictionary |
-| 3 | Acceptance: `/orders/{{record.orderId}}/items` yields orderId as top candidate; `{{join a b}}` ignored |
+| 1 | Replace the last-segment prefix logic (patternFinder.js:294–297) with an all-segment extractor. **Prefer the Handlebars parser** (already a patternFinder dependency) over a regex: production URIs commonly use triple braces (`{{{data.id}}}.json`), and while a plain `\{\{…\}\}` regex does match triple braces by offset, it fails on bracketed paths (`record.items[0].id`) and cannot distinguish helpers. If a regex is used anyway, explicitly support double and triple braces |
+| 2 | Take the leaf name of each `record.*` / `data.*` path; skip helpers and complex expressions |
+| 3 | Candidate order: extracted fields first, then URI nouns, then dictionary |
+| 4 | Acceptance: `/orders/{{record.orderId}}/items` yields orderId as top candidate; `{{{data.id}}}.json` yields id; `{{join a b}}` and `{{{encodeURI …}}}` ignored |
 
 </details>
 
@@ -159,7 +160,7 @@ selectTraceKeyField(records, candidates, options)
 |---:|---|
 | 1 | Deterministic: fixed candidate order, first candidate that passes wins |
 | 2 | Job stickiness: cache the selected field per `_flowId + _exportId`; v1 uniqueness is page-scoped only |
-| 3 | Integration: exportDataConverter.js:26–104 selects once per composite page; endpoint-service preview mirrors via responseTransformUtil |
+| 3 | Integration: exportDataConverter.js:26–104 selects once per composite page (adaptor path); flow-execution `injectTraceKeys` (abstractBranchedFlowMessageProcessor.js:3213–3239) selects once per full worker page; endpoint-service preview mirrors via responseTransformUtil |
 | 4 | Logging: field name, counts and reason only — never sampled record values |
 | 5 | Edge cases to settle in design review: **minimum sample size** (a one-row page is trivially unique — require N ≥ ~10 or defer selection), empty pages, array/object/mixed-type values, composite candidates |
 | 6 | First-page uncertainty and **job-cache invalidation** on schema drift mid-job; cross-page collisions are out of scope in v1 — document as a known limitation |
@@ -172,7 +173,7 @@ selectTraceKeyField(records, candidates, options)
 
 | # | Step |
 |---:|---|
-| 1 | Gate v1: accept a candidate only if distinct non-null values === non-null rows AND non-null coverage ≥ 90% of the page; else fall through; if none pass, null + reason |
+| 1 | Gate v1: accept a candidate only if distinct non-null values === non-null rows AND non-null coverage ≥ 90% of the page; else fall through; if none pass, null + reason. Applies at both batch points: adaptor `exportDataConverter` and flow-execution `injectTraceKeys` |
 | 2 | Inferred keys only. User templates never blocked at runtime — preview warning with collision count; template enforcement requires Product approval |
 | 3 | Endpoint output: `{ traceKeysDuplicate, duplicateCount, source: template\|inferred, reason }` (responseTransformUtil.js:102–105, 129–141) |
 | 4 | UI: CeligoTraceKeyWarning shows collision count and source |
@@ -221,12 +222,16 @@ selectTraceKeyField(records, candidates, options)
 
 ```js
 getTraceKeyResult(record, template, traceKeyPattern, _flowId)
-// → { value, source: 'template'|'custom'|'map'|'dictionary'|null,
+// → { value, source: 'template'|'custom'|'pattern'|null,
 //     field, reason, truncated }
 // reason ∈ { OK, TEMPLATE_EVAL_FAILED, TEMPLATE_EMPTY, NO_CANDIDATE_FIELD,
 //            CANDIDATES_NOT_UNIQUE, EMPTY_RECORD }
 // truncated: boolean result flag — truncation still produces a valid key,
 // so it is NOT a no-key reason
+// v1 source stops at 'pattern': map-vs-dictionary provenance is lost today
+// because prioritizeFields merges all candidates into one flat string array.
+// Granular map|dictionary sourcing requires annotated candidates
+// ({ field, source }) — a bigger contract change, deferred to v2.
 ```
 
 | # | Step |
@@ -284,6 +289,10 @@ The split becomes measurable once D2 ships (Phase 1) and error codes appear in t
 start-work pack then joins ~10 CF2 exports' configured template strings to one parsed record
 sample each to classify the remainder.
 
+**Follow-up required:** file a dedicated data spike ("Classify CF2 with-template blanks using
+D2 telemetry + ~10 template-to-record-shape sample joins"). Until it completes, deliverable 4
+status is: **mechanisms confirmed; production cause distribution pending follow-up**.
+
 ### Fix mapping
 
 | Fix | Phase | What it addresses |
@@ -309,7 +318,7 @@ This matrix records the audit verdict for each, making the validation auditable.
 | 6 | Handlebars field reference in URI is discarded | **Confirmed** | patternFinder.js:294–297 keeps only the literal prefix before `{{` | C3 | None — ready to build |
 | 7 | `api` is the only hardcoded URI exclusion | **Confirmed with modification** — `v1`/`v2` are already rejected by the alpha-only regex; `API` survives because the check is case-sensitive | patternFinder.js:286–309 | C9 | Final word-list review in PR |
 | 8 | No uniqueness check anywhere | **Confirmed** | `findTraceKey` stamps the first matching field, no distinctness validation | C5, C6 | Gate edge-case design (see C5/C6 packs) |
-| 9 | REST-to-HTTP conversion loses resource metadata | **Not verified in this spike** | REST routes to the same inference function, but the conversion path itself was not audited | — | Separate follow-up audit of conversion metadata |
+| 9 | REST-to-HTTP conversion loses resource metadata | **Not verified in this spike** | REST routes to the same inference function, but the conversion path itself was not audited | — | **File a dedicated follow-up audit ticket** for the conversion path (what metadata existed pre-conversion, what survives on the HTTP doc) |
 
 ---
 
@@ -333,8 +342,9 @@ This matrix records the audit verdict for each, making the validation auditable.
 | Rule | Items |
 |---|---|
 | Ship independently | D5, Change 9, Change 3, D2 |
-| Ordered pairs | D1 consumer before D1 producer; D4 after D1 consumer |
-| Must batch | D3 + Change 1 + Change 2 · Change 5 + Change 6 · Change 4 + Change 6 · Change 10 follows 5/6 |
+| Hard ordering | D1 consumer before D1 producer |
+| Hard batches | Change 5 + Change 6 (one framework) · Change 4 only after the Change 6 gate exists · Change 10 builds on the 5/6 result API |
+| Recommended (not hard dependencies) | D3 + Change 1 + Change 2 as one train — Change 1 alone already improves connections that have a legacy assistant; D3/C2 extend the reach to CF2 and generic HTTP · D4 after D1 consumer — D4 alone still fixes the fields-based preview fallback; only the map-template portion stays dead until D1 |
 | Conditional | Change 7 fallback waits for Change 5; Change 8 waits for D2 telemetry |
 | Hard constraint (D6) | Every train publishes tracekey-common → tracekey → bumps identical pins across all consumers |
 
