@@ -47,11 +47,11 @@ D1–D6 are **not** part of the ten proposed changes. They are existing bugs dis
 
 | Defect | Location & issue | Fix summary | What the fix solves |
 |---|---|---|---|
-| **D1** | Producer returns `templates` (patternFinder.js:113/143); consumer reads `template` (main.js:47–52) | Consumer accepts both keys; producer emits `template` (keep `templates` one release) | NetSuite (`{{Images.image_record_id}}`) and Zendesk (`{{name}}-{{email}}`) map templates start working; unblocks Change 1 |
+| **D1** | Producer returns `templates` (patternFinder.js:113/143); consumer reads `template` (main.js:47–52) | Consumer accepts both keys; producer emits `template` (keep `templates` one release) | NetSuite (`{{Images.image_record_id}}`) and Zendesk (`{{name}}-{{email}}`) map templates start working; unblocks template-based Change 1 profiles (field-only profiles ship independently) |
 | **D2** | evalExpressionSync wrapper passed to processTraceKey (main.js:201–211); failures collapse to null | Unwrap wrapper; return null on error. Telemetry: aggregate **once per flow/template/reason** with a structured `logName` — never per-record warnings. **Never log raw template strings** (they can embed sensitive values) — log a template fingerprint (hash) plus the error code | Separates "template failed" from "field empty"; foundation for Change 10 and Change 8 attribution |
 | **D3** | Map lookup uses `assistant \|\| type`; CF2 connections often have no assistant (connection.js:5507–5517) | Resolve legacyId at pattern-build time when `_httpConnectorId` present | CF2 connectors inherit curated map profiles; attacks 77.34% CF2 no-template cohort |
 | **D4** | Preview calls getTraceKey without traceKeyPattern (responseTransformUtil.js:11) | Not a one-file fix: the pattern **originates** at design time (em-util → flow-management `getTraceKeyPattern`); the preview API contract must carry it into endpoint-service (processorService → responseTransformUtil), or endpoint-service must compute it from exportDoc + connection. Test **both** configured-template and no-template preview paths | Preview matches production for the **no-template** path (an explicit template short-circuits before pattern fallback — main.js:41–43 — so D4 does not affect the with-template cohort) |
-| **D5** | flowCache is unbounded array (main.js:21, 56–59); undercounts missing-key telemetry | Replace with size-capped Set; keep once-per-flow logging | Bounds worker memory; does **not** cause duplicates — only undercounts missing-key logs |
+| **D5** | flowCache is unbounded array (main.js:21, 56–59); undercounts missing-key telemetry | Replace with a **bounded LRU** (defined max entries, evict least-recently-seen) or TTL-based cache — not merely a size-capped Set, which needs an eviction policy anyway; keep once-per-flow logging | Bounds worker memory; does **not** cause duplicates — only undercounts missing-key logs |
 | **D6** | Consumer version skew (8.0.1–8.0.19 across repos) | Publish tracekey-common → tracekey; bump identical pins every phase | Prevents design-time, preview, and production running different algorithms |
 
 ---
@@ -111,7 +111,7 @@ D1–D6 are **not** part of the ten proposed changes. They are existing bugs dis
 |---|---|
 | `hostname.endsWith('.myshopify.com')` | shopify profile |
 | `/^sellingpartnerapi(-[a-z]{2,4})?\.amazon\.com$/` (explicit regional variants) | new amazonsp profile |
-| `/^mws(\.[a-z-]+)?\.amazonservices\.[a-z.]+$/` | amazonmws profile |
+| `/^mws(?:-[a-z]{2})?\.amazonservices\.[a-z.]+$/` (covers regional hosts like `mws-eu.amazonservices.com`) | amazonmws profile |
 
 Parse `baseURI` with the URL API and match the extracted hostname **anchored** — never
 substring "contains" matching, which deceptive or malformed URLs (path segments, userinfo
@@ -157,8 +157,10 @@ tricks) can spoof into a false connector classification.
 ```js
 // utils/tracekey-common/lib/tracekey/batchInference.js
 selectTraceKeyField(records, candidates, options)
-// → { field, path, confidence, reason, distinctCount, rowCount }
+// → { field, path, reason, distinctCount, rowCount }
 // reason ∈ { UNIQUE_MATCH, NOT_UNIQUE, NO_CANDIDATE, EMPTY_PAGE }
+// No separate `confidence` in v1 — distinctCount/rowCount carries the
+// selection-quality signal; a derived score can be added later if needed.
 ```
 
 | # | Step |
@@ -338,7 +340,7 @@ This matrix records the audit verdict for each, making the validation auditable.
 | 2 | 1 · Correctness | Low | D1 producer + Change 3 + Change 9 (`tracekey/patternFinder.js`) | After step 1 |
 | 3 | 1 · Correctness | Low | D4 (`endpoint-service/responseTransformUtil.js`) | After step 1 published |
 | 4 | 2 · Connector coverage | Medium | D3 — CF2 legacyId resolution | em-util/flow-management getTraceKeyPattern |
-| 5 | 2 · Connector coverage | Medium | Change 1 + Change 2 | Batched with D3 |
+| 5 | 2 · Connector coverage | Medium | Change 1 + Change 2 | Recommended train with D3 (not a hard dependency — see Dependency Rules) |
 | 6 | 3 · Parity + GraphQL | Medium | Change 8 remainder | After D2 error telemetry proves cause |
 | 7 | 3 · Parity + GraphQL | Medium | Change 7 — GraphQL resourcePath | Parallel with step 6 |
 | 8 | 4 · Batch framework | High | Change 5 + Change 6 | One project |
