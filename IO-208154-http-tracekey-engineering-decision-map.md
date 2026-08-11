@@ -6,13 +6,14 @@ Fresh validation of all ten proposals against clean current-main clones, the lin
 
 ## 1. Executive Summary
 
-**Bottom line:** Ship the small correctness fixes first, but do not implement the ten items as ten isolated PRs. Changes 5 and 6 require one batch-aware framework; Change 8 is three concrete parity defects; and Change 10 should expose reasons without generating a synthetic key. The largest operational risk is package skew across design-time, workers, and preview.
+**Bottom line:** Ship the small correctness fixes first, but do not implement the ten items as ten isolated PRs. Changes 5 and 6 require one batch-aware framework; Change 8 is a shared-evaluator problem — one confirmed silent-failure defect (D2) plus a strong wrong-record-shape hypothesis pending production samples (see 4.2); and Change 10 should expose reasons without generating a synthetic key. The largest operational risk is package skew across design-time, workers, and preview.
 
 | Metric | Value |
 |---|---:|
 | Changes mapped to code | 10 / 10 |
 | Current defects found (D1–D6) | 6 |
-| Repositories in rollout path | 8 |
+| Repositories audited (clean main clones) | 10 |
+| Repositories in the deployment path | 8 |
 | Product source files changed (read-only audit) | 0 |
 
 ---
@@ -29,6 +30,15 @@ Fresh validation of all ten proposals against clean current-main clones, the lin
 
 *Source: Google Sheet "Summary w/ config from logs". These are log-level percentages; the Confluence 3.9% → 21.5% statement is a job-level duplicate metric and should not be compared directly.*
 
+### Data Provenance and Known Limitations
+
+| Item | Detail |
+|---|---|
+| Data window | `FLOW_LOG_SUMMARY` covers only ~25 days (Mar 22 – Apr 15) and is **stale since April 15** — a data-pipeline ticket should be raised before setting new KPI baselines (per the source Confluence page) |
+| Denominator inflation | 529 internal "Worker Health Check Export" exports (hitting `system/v1/timestamp` every ~20 min) add ~2.4M no-key logs; they must be **excluded from trace-key KPI denominators** |
+| Metric level | All percentages above are log-level, extracted from the evidence workbook; job-level metrics from Confluence are not directly comparable |
+| Still needed | Exact extraction date, query filters and per-cohort denominators should be attached to the workbook before these numbers are used as rollout baselines |
+
 ---
 
 ## 3. Defects Found During the Audit (D1–D6)
@@ -38,9 +48,9 @@ D1–D6 are **not** part of the ten proposed changes. They are existing bugs dis
 | Defect | Location & issue | Fix summary | What the fix solves |
 |---|---|---|---|
 | **D1** | Producer returns `templates` (patternFinder.js:113/143); consumer reads `template` (main.js:47–52) | Consumer accepts both keys; producer emits `template` (keep `templates` one release) | NetSuite (`{{Images.image_record_id}}`) and Zendesk (`{{name}}-{{email}}`) map templates start working; unblocks Change 1 |
-| **D2** | evalExpressionSync wrapper passed to processTraceKey (main.js:201–211); failures collapse to null | Unwrap wrapper; rate-limited warn with error code only; return null on error | Separates "template failed" from "field empty"; foundation for Change 10 and Change 8 attribution |
+| **D2** | evalExpressionSync wrapper passed to processTraceKey (main.js:201–211); failures collapse to null | Unwrap wrapper; return null on error. Telemetry: aggregate **once per flow/template/reason** with a structured `logName` — never per-record warnings | Separates "template failed" from "field empty"; foundation for Change 10 and Change 8 attribution |
 | **D3** | Map lookup uses `assistant \|\| type`; CF2 connections often have no assistant (connection.js:5507–5517) | Resolve legacyId at pattern-build time when `_httpConnectorId` present | CF2 connectors inherit curated map profiles; attacks 77.34% CF2 no-template cohort |
-| **D4** | Preview calls getTraceKey without traceKeyPattern (responseTransformUtil.js:11) | Thread traceKeyPattern through preview fallback path | Preview matches production trace-key resolution and duplicate warnings |
+| **D4** | Preview calls getTraceKey without traceKeyPattern (responseTransformUtil.js:11) | Not a one-file fix: the pattern **originates** at design time (em-util → flow-management `getTraceKeyPattern`); the preview API contract must carry it into endpoint-service (processorService → responseTransformUtil), or endpoint-service must compute it from exportDoc + connection. Test **both** configured-template and no-template preview paths | Preview matches production for the **no-template** path (an explicit template short-circuits before pattern fallback — main.js:41–43 — so D4 does not affect the with-template cohort) |
 | **D5** | flowCache is unbounded array (main.js:21, 56–59); undercounts missing-key telemetry | Replace with size-capped Set; keep once-per-flow logging | Bounds worker memory; does **not** cause duplicates — only undercounts missing-key logs |
 | **D6** | Consumer version skew (8.0.1–8.0.19 across repos) | Publish tracekey-common → tracekey; bump identical pins every phase | Prevents design-time, preview, and production running different algorithms |
 
@@ -50,18 +60,18 @@ D1–D6 are **not** part of the ten proposed changes. They are existing bugs dis
 
 | # | Title | Status | Size | Phase | Primary owner | Primary locations |
 |---:|---|---|---|---:|---|---|
-| 1 | Expand assistant map | Proceed after D1 | S | 2 | integrator-common-util | map.js, patternFinder.js, main.js |
+| 1 | Expand assistant map | Proceed after D1 | M | 2 | integrator-common-util | map.js, patternFinder.js, main.js |
 | 2 | Detect Shopify/Amazon HTTP | Rework | S | 2 | integrator-common-util | patternFinder.js, connection.js, map.js |
 | 3 | Extract Handlebars from URI | Proceed | S | 1 | integrator-common-util | patternFinder.js:274–311 |
 | 4 | Widen identifier fallbacks | HTTP-scope | S | 4 | integrator-common-util | patternFinder.js:274–311 |
 | 5 | Response-batch inference | Framework | M/L | 4 | common-util + adaptor + endpoint/UI only | tracekey-common, exportDataConverter, abstractExport, endpoint |
 | 6 | Pre-stamp uniqueness gate | With Change 5 | M | 4 | common-util + adaptor + endpoint/UI only | tracekey-common, adaptor, endpoint, UI |
-| 7 | GraphQL support | Proceed | S | 3 | integrator-common-util | connection.js, patternFinder.js, main.js |
-| 8 | CF2/template divergence | Needs samples | S | 3 | common-util + endpoint | main.js, baseHBDelegate.js, endpoint |
+| 7 | GraphQL support | Proceed | M | 3 | integrator-common-util | connection.js, patternFinder.js, main.js |
+| 8 | CF2/template divergence | Needs samples | M | 3 | common-util + endpoint | main.js, baseHBDelegate.js, endpoint |
 | 9 | Reduce noisy URI segments | Proceed | S | 1 | integrator-common-util | patternFinder.js:286–309 |
-| 10 | Explicit no-reliable-key state | Proceed | S | 4 | common-util + adaptor + FE + endpoint/UI | main.js, abstractAdaptor, qgmw, endpoint, UI |
+| 10 | Explicit no-reliable-key state | Proceed | L | 4 | common-util + adaptor + FE + endpoint/UI | main.js, abstractAdaptor, qgmw, endpoint, UI |
 
-*Size legend: size = total effort (research, tests, rollout) — not diff size. Most code diffs are tens of lines; Changes 5 and 6 are the only large builds (breadth across four repos).*
+*Size legend: size = total effort (research, validation, tests, rollout) — not diff size. Sizes recalibrated after external review: Changes 1, 7 and 8 carry real research/sampling effort beyond their small diffs (M); Change 10 spans a five-repo API and UI propagation (L); Changes 5 and 6 remain the largest framework builds.*
 
 ### Key Caveats
 
@@ -105,7 +115,7 @@ D1–D6 are **not** part of the ten proposed changes. They are existing bugs dis
 
 | # | Step |
 |---:|---|
-| 1 | Derive `inferredAssistant` in patternFinder.js:29–82 only when `connection.assistant \|\| connection.type` is empty; pass into map prioritization at 108–143; never override a real assistant |
+| 1 | Trigger condition (corrected): run inference when there is **no explicit `connection.assistant`** and `connection.type` is generic (`http` / `rest`) — equivalently, after the map lookup at patternFinder.js:108–110 returns no profile. Note: `connection.type` is always set for generic HTTP, so a naive "assistant \|\| type is empty" guard would never fire. Never override a real assistant |
 | 2 | Amazon SP-API: dedicated map profile after response validation (AmazonOrderId, orderId, ASIN, sku) — do not reuse the MWS profile |
 | 3 | Acceptance: one test per host rule + negative test for arbitrary hosts |
 
@@ -151,6 +161,9 @@ selectTraceKeyField(records, candidates, options)
 | 2 | Job stickiness: cache the selected field per `_flowId + _exportId`; v1 uniqueness is page-scoped only |
 | 3 | Integration: exportDataConverter.js:26–104 selects once per composite page; endpoint-service preview mirrors via responseTransformUtil |
 | 4 | Logging: field name, counts and reason only — never sampled record values |
+| 5 | Edge cases to settle in design review: **minimum sample size** (a one-row page is trivially unique — require N ≥ ~10 or defer selection), empty pages, array/object/mixed-type values, composite candidates |
+| 6 | First-page uncertainty and **job-cache invalidation** on schema drift mid-job; cross-page collisions are out of scope in v1 — document as a known limitation |
+| 7 | Run in **shadow mode first**: compute and log the selection without stamping; enable stamping only after shadow metrics validate the selection quality |
 
 </details>
 
@@ -163,6 +176,8 @@ selectTraceKeyField(records, candidates, options)
 | 2 | Inferred keys only. User templates never blocked at runtime — preview warning with collision count; template enforcement requires Product approval |
 | 3 | Endpoint output: `{ traceKeysDuplicate, duplicateCount, source: template\|inferred, reason }` (responseTransformUtil.js:102–105, 129–141) |
 | 4 | UI: CeligoTraceKeyWarning shows collision count and source |
+| 5 | Edge cases to settle in design review: define the fate of the allowed ≤10% null rows (stamped null + reason vs excluded from the gate calculation), minimum sample size before the gate is trusted, and behavior on empty pages |
+| 6 | **Shadow mode before enforcement**: log would-be rejections (candidate, collision count, reason) without changing stamping; flip to enforcement only after shadow data confirms the gate is not rejecting good keys |
 
 </details>
 
@@ -172,7 +187,7 @@ selectTraceKeyField(records, candidates, options)
 | # | Step |
 |---:|---|
 | 1 | Detect via connection formType `graph_ql` / `assistant_graphql` (connection.js:317–324) |
-| 2 | Candidate order: leaf of `export.http.response.resourcePath` first, then id / node.id from emitted record shape (Relay: `edges[].node.id`); query-body parsing last resort |
+| 2 | Candidate order: from `export.http.response.resourcePath`, **strip known envelope segments** (`data`, `edges`, `node`, `nodes`, `items`, `results`) and select the semantic resource — a naive "leaf of resourcePath" would pick `edges` from `data.orders.edges`. Then id / node.id from the emitted record shape (Relay: `edges[].node.id`); query-body parsing last resort |
 | 3 | Do not raise the global BFS depth; keep GraphQL-specific handling in patternFinder |
 
 </details>
@@ -206,9 +221,12 @@ selectTraceKeyField(records, candidates, options)
 
 ```js
 getTraceKeyResult(record, template, traceKeyPattern, _flowId)
-// → { value, source: 'template'|'custom'|'map'|'dictionary'|null, field, reason }
+// → { value, source: 'template'|'custom'|'map'|'dictionary'|null,
+//     field, reason, truncated }
 // reason ∈ { OK, TEMPLATE_EVAL_FAILED, TEMPLATE_EMPTY, NO_CANDIDATE_FIELD,
-//            CANDIDATES_NOT_UNIQUE, EMPTY_RECORD, TRUNCATED }
+//            CANDIDATES_NOT_UNIQUE, EMPTY_RECORD }
+// truncated: boolean result flag — truncation still produces a valid key,
+// so it is NOT a no-key reason
 ```
 
 | # | Step |
@@ -229,21 +247,25 @@ template is configured, while legacy HTTP with a template blanks only 0.24%?
 **Conclusion:** there is **no separate CF 2.0 evaluation path**. CF2 and legacy HTTP stamp
 trace keys through the exact same evaluator — `getTraceKeyValueByTemplate()` in
 `tracekey-common/lib/tracekey/main.js` calling `hbUtil.evalExpressionSync(template, ctx, { strict: true })`.
-The divergence is not *how* templates are evaluated but *what they are evaluated against*,
-compounded by two defects that hide the failures.
+The divergence is not *how* templates are evaluated but *what they are evaluated against*.
+Findings below are labeled by confidence.
 
-### The three mechanisms
+### Findings by confidence
 
-| # | Mechanism | What happens | Evidence |
-|---|---|---|---|
-| A | **Resource-wrapped records** | CF2 connectors emit records wrapped in a resource envelope (e.g. the record is `{ addon: {...} }`, so the id lives at `record.addon.id`). Users write `{{record.id}}` assuming the legacy shape, where the record *is* the resource. Under `strict: true`, the missing path fails the evaluation | CF2 response fixtures in http-adaptor; template strings joined to parsed record shapes |
-| B | **Strict failures collapse silently (D2)** | `evalExpressionSync` returns `{ value }` or `{ error }`. `main.js:201–211` passes the wrapper straight into `processTraceKey()`, so a strict-mode error becomes a null key with no log and no reason. Every wrong-path template from mechanism A turns into an invisible blank | main.js:201–211; no error telemetry exists for template failures today |
-| C | **Preview omits the pattern (D4)** | endpoint-service preview calls `getTraceKey(record, template)` without `traceKeyPattern` (responseTransformUtil.js:11), so design-time preview can disagree with production. Users have no signal at configure time that their template resolves to nothing in the real worker path | responseTransformUtil.js:11 vs worker path in flow-execution |
+| Confidence | Finding | Evidence |
+|---|---|---|
+| **Confirmed** | Shared evaluator — both cohorts funnel into the same `tracekey-common` functions; a separate CF2 evaluation path is disproven | Code reading of main.js and both adaptor call paths |
+| **Confirmed** | Silent wrapper handling (D2) — `evalExpressionSync` returns `{ value }` or `{ error }`; `main.js:201–211` passes the wrapper into `processTraceKey()`, so every strict-mode failure becomes a null key with no log and no reason | main.js:201–211; no template-failure telemetry exists today |
+| **Strong hypothesis** | Wrong record path/context — CF2 resource-wrapped records (id at `record.addon.id`, not `record.id`) plus the missing `data.*` alias in bare `BaseHbDelegate` (legacy `oldContext.js:45–53` exposes both `data.*` and root fields) cause strict failures for templates written against the legacy shape | CF2 response fixtures in http-adaptor; context comparison — **not yet joined to production samples** |
+| **Unverified** | Production cause distribution — how much of the 20.14% is wrong-path vs eval-failure vs something else | Requires D2 telemetry + ~10 CF2 samples (C8 pack) |
+| **Unverified** | Duplicate mechanism (9.50% vs 1.50% legacy) — partially-resolving templates producing repeated static-ish values is plausible but unproven | Requires the same sample joins |
 
-A secondary context gap: legacy HTTP's Handlebars context (`oldContext.js:45–53`) exposes both
-`data.*` and root-level fields, while the bare `BaseHbDelegate` used in trace-key evaluation
-does not provide the `data.*` alias. Templates written as `{{data.id}}` — valid elsewhere in
-legacy HTTP — fail silently under trace-key evaluation for the same D2 reason.
+### Adjacent defect — D4 is not a cause of this cohort
+
+Preview omitting `traceKeyPattern` (D4) does **not** explain the with-template blank rate:
+an explicit template returns from evaluation at `main.js:41–43` *before* the pattern fallback
+is ever consulted. D4 breaks preview parity only for the **no-template** path; it ships in
+Phase 1 for that reason, not as a CF2-divergence fix.
 
 ### What was ruled out
 
@@ -254,18 +276,11 @@ legacy HTTP — fail silently under trace-key evaluation for the same D2 reason.
 - **The D3 CF2 assistant-map bypass** — real, but it affects the **no-template** cohort
   (77.34% blank), not the 20.14% with-template cohort.
 
-### Why the duplicate rate is also high (9.50% vs 1.50% legacy)
-
-The same wrong-shape templates that usually fail can partially resolve — e.g. a template with
-static text plus a field that is missing on most records evaluates to the same static-ish value
-repeatedly, producing collisions instead of blanks. Blank rate and duplicate rate are two
-symptoms of one cause: templates written against the wrong record shape.
-
 ### Quantification — why the split isn't in this spike
 
 Splitting the 20.14% into "wrong path" vs "evaluation failure" is impossible from today's logs
-because mechanism B swallows the distinction: both cases land as the same null. The split
-becomes measurable once D2 ships (Phase 1) and error codes appear in telemetry. The C8
+because the silent wrapper handling swallows the distinction: both cases land as the same null.
+The split becomes measurable once D2 ships (Phase 1) and error codes appear in telemetry. The C8
 start-work pack then joins ~10 CF2 exports' configured template strings to one parsed record
 sample each to classify the remainder.
 
@@ -273,9 +288,28 @@ sample each to classify the remainder.
 
 | Fix | Phase | What it addresses |
 |---|---|---|
-| D2 — unwrap `{value, error}`, log error code, return reason | 1 | Makes mechanism B visible; enables the wrong-path vs eval-failure split |
-| D4 — thread `traceKeyPattern` through preview | 1 | Makes mechanism C honest; preview matches production |
-| Change 8 remainder — trace-key-only `data` alias in main.js:201–228 (preferred) or nested-path guidance in UI | 3 | Addresses mechanism A and the `data.*` context gap; approach chosen after D2 telemetry classifies the blanks |
+| D2 — unwrap `{value, error}`, aggregate error telemetry, return reason | 1 | Makes silent failures visible; enables the wrong-path vs eval-failure split |
+| D4 — carry `traceKeyPattern` into preview (see D4 scope in Section 3) | 1 | Restores preview parity for the **no-template** path — adjacent defect, not a cause of this cohort |
+| Change 8 remainder — trace-key-only `data` alias in main.js:201–228 (preferred) or nested-path guidance in UI | 3 | Addresses the wrong-path hypothesis and the `data.*` context gap; approach chosen after D2 telemetry classifies the blanks |
+
+---
+
+## 4.3 Root-Cause Coverage Matrix (Spike Deliverable 1)
+
+The source Confluence page identifies nine root causes for HTTP/REST trace-key failures.
+This matrix records the audit verdict for each, making the validation auditable.
+
+| RC | Confluence root cause | Verdict | Evidence | Changes | Remaining validation |
+|---|---|---|---|---|---|
+| 1 | Assistant map covers only 22 of 49+ HTTP apps (eBay 0%, Walmart 3%, Slack 8.9% stamped) | **Confirmed** | map.js has 22 entries; the named connectors are absent | C1, C2 (+ D1, D3 prerequisites) | Field research per connector before merge |
+| 2 | URI-only heuristic, no response inspection — 89% of missing generic HTTP keys from ~2,259 custom API exports | **Confirmed** | patternFinder derives candidates solely from `http.relativeURI` | C4, C5 | Traffic-share modeling to size the impact |
+| 3 | Templates make duplicates worse for generic HTTP (3.9% → 21.5% job-level) | **Confirmed (data)** — mechanism is the absence of preview-time uniqueness validation | Evidence workbook; no gate exists anywhere in the code | C6 | Product decision on user-template enforcement |
+| 4 | CF 2.0 underperforms legacy HTTP with templates (20.1% blank, 9.5% dup) | **Modified** — "different evaluation path" is disproven; wrong record shape + silent strict failures instead (see 4.2) | Section 4.2 findings-by-confidence table | C8, D2 (D4 adjacent) | ~10 production samples after D2 telemetry |
+| 5 | GraphQL endpoints are a dead end (`*graphql` candidate matches nothing) | **Confirmed** | URI inference emits `*graphql`; runtime regex `/.*(graphql).?id$/i` matches nothing meaningful | C7 | 2–3 real GraphQL export configs |
+| 6 | Handlebars field reference in URI is discarded | **Confirmed** | patternFinder.js:294–297 keeps only the literal prefix before `{{` | C3 | None — ready to build |
+| 7 | `api` is the only hardcoded URI exclusion | **Confirmed with modification** — `v1`/`v2` are already rejected by the alpha-only regex; `API` survives because the check is case-sensitive | patternFinder.js:286–309 | C9 | Final word-list review in PR |
+| 8 | No uniqueness check anywhere | **Confirmed** | `findTraceKey` stamps the first matching field, no distinctness validation | C5, C6 | Gate edge-case design (see C5/C6 packs) |
+| 9 | REST-to-HTTP conversion loses resource metadata | **Not verified in this spike** | REST routes to the same inference function, but the conversion path itself was not audited | — | Separate follow-up audit of conversion metadata |
 
 ---
 
@@ -315,16 +349,16 @@ sample each to classify the remainder.
 
 ---
 
-## 6. Expected Metric Impact by Phase
+## 6. Expected Metric Impact by Phase (Hypotheses)
 
-*Directional targets only — exact gains depend on connector traffic mix. Verify each phase: re-run workbook queries (no-key % and duplicate % per cohort) plus D2 template-failure metric, four weeks pre/post deploy.*
+*These are **hypotheses, not modeled commitments** — exact gains depend on connector traffic mix, which has not been measured per cohort. Before each phase deploys, define a measurable acceptance threshold (e.g. "no-key % in the target cohort improves by ≥ X points within 4 weeks") and a rollback criterion (e.g. "duplicate % must not rise by more than Y points"). Verify with re-run workbook queries plus the D2 template-failure metric, using denominators that exclude the 529 health-check exports (see Section 2 provenance).*
 
-| Phase | Coverage | Duplicates | Measurement / Explainability |
+| Phase | Coverage (hypothesis) | Duplicates (hypothesis) | Measurement / Explainability |
 |---|---|---|---|
-| After Phase 1 | Small direct gain (single-digit points off 84.37% legacy no-template) | Fewer wrong keys from URI noise (Change 9) | D2 makes template-failure rate measurable; D4 makes preview match production |
-| After Phase 2 | Biggest no-template lever — targeted connectors drop from 84.37% / 77.34% toward near-complete keys | Roughly flat — curated map fields, low collision risk | — |
-| After Phase 3 | CF2 with-template no-key: 20.14% → low single digits (legacy 0.24% is the ceiling); GraphQL no-template: 7.42% → under ~3% | CF2 template duplicates (9.50%): partial improvement via nested-path guidance | — |
-| After Phase 4 | Batch inference catches long-tail APIs with non-standard ID fields | Uniqueness gate drives inferred-key duplicates (0.33%–10.79%) toward zero | Change 10 reason codes eliminate "unknown missing" bucket |
+| After Phase 1 | Small direct gain off 84.37% legacy no-template | Fewer wrong keys from URI noise (Change 9) | D2 makes template-failure rate measurable; D4 restores no-template preview parity |
+| After Phase 2 | Largest no-template lever — targeted connectors improve materially; gain is proportional to their traffic share, which must be measured before setting a numeric target | Roughly flat — curated map fields, low collision risk | — |
+| After Phase 3 | CF2 with-template no-key (20.14%) reduced materially — legacy-template 0.24% is the theoretical ceiling; GraphQL no-template (7.42%) reduced — model a target after D2 telemetry lands | CF2 template duplicates (9.50%): partial improvement via nested-path guidance | — |
+| After Phase 4 | Batch inference catches long-tail APIs with non-standard ID fields | Uniqueness gate reduces inferred-key duplicates (0.33%–10.79% today); validate in shadow mode before claiming a number | Change 10 reason codes eliminate the "unknown missing" bucket |
 
 ---
 
@@ -334,7 +368,7 @@ sample each to classify the remainder.
 |---:|---|---|---|
 | 1 | `integrator-common-util` · `tracekey-common/lib/tracekey/main.js` | D1 consumer · D2 · D5 | Publish first |
 | 2 | `integrator-common-util` · `tracekey/lib/tracekey/patternFinder.js` | D1 producer · Change 3 · Change 9 (new feature code — not automatic from defect fixes) | After PR 1 |
-| 3 | `endpoint-service` · `responseTransformUtil.js` | D4 | After PR 1 published |
+| 3 | `endpoint-service` · `responseTransformUtil.js` + preview API contract (pattern must originate upstream — see D4 scope in Section 3) | D4 | After PR 1 published |
 
 ---
 
