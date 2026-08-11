@@ -48,7 +48,7 @@ D1–D6 are **not** part of the ten proposed changes. They are existing bugs dis
 | Defect | Location & issue | Fix summary | What the fix solves |
 |---|---|---|---|
 | **D1** | Producer returns `templates` (patternFinder.js:113/143); consumer reads `template` (main.js:47–52) | Consumer accepts both keys; producer emits `template` (keep `templates` one release) | NetSuite (`{{Images.image_record_id}}`) and Zendesk (`{{name}}-{{email}}`) map templates start working; unblocks Change 1 |
-| **D2** | evalExpressionSync wrapper passed to processTraceKey (main.js:201–211); failures collapse to null | Unwrap wrapper; return null on error. Telemetry: aggregate **once per flow/template/reason** with a structured `logName` — never per-record warnings | Separates "template failed" from "field empty"; foundation for Change 10 and Change 8 attribution |
+| **D2** | evalExpressionSync wrapper passed to processTraceKey (main.js:201–211); failures collapse to null | Unwrap wrapper; return null on error. Telemetry: aggregate **once per flow/template/reason** with a structured `logName` — never per-record warnings. **Never log raw template strings** (they can embed sensitive values) — log a template fingerprint (hash) plus the error code | Separates "template failed" from "field empty"; foundation for Change 10 and Change 8 attribution |
 | **D3** | Map lookup uses `assistant \|\| type`; CF2 connections often have no assistant (connection.js:5507–5517) | Resolve legacyId at pattern-build time when `_httpConnectorId` present | CF2 connectors inherit curated map profiles; attacks 77.34% CF2 no-template cohort |
 | **D4** | Preview calls getTraceKey without traceKeyPattern (responseTransformUtil.js:11) | Not a one-file fix: the pattern **originates** at design time (em-util → flow-management `getTraceKeyPattern`); the preview API contract must carry it into endpoint-service (processorService → responseTransformUtil), or endpoint-service must compute it from exportDoc + connection. Test **both** configured-template and no-template preview paths | Preview matches production for the **no-template** path (an explicit template short-circuits before pattern fallback — main.js:41–43 — so D4 does not affect the with-template cohort) |
 | **D5** | flowCache is unbounded array (main.js:21, 56–59); undercounts missing-key telemetry | Replace with size-capped Set; keep once-per-flow logging | Bounds worker memory; does **not** cause duplicates — only undercounts missing-key logs |
@@ -60,7 +60,7 @@ D1–D6 are **not** part of the ten proposed changes. They are existing bugs dis
 
 | # | Title | Status | Size | Phase | Primary owner | Primary locations |
 |---:|---|---|---|---:|---|---|
-| 1 | Expand assistant map | Proceed after D1 | M | 2 | integrator-common-util | map.js, patternFinder.js, main.js |
+| 1 | Expand assistant map | Proceed (templates need D1) | M | 2 | integrator-common-util | map.js, patternFinder.js, main.js |
 | 2 | Detect Shopify/Amazon HTTP | Rework | M | 2 | integrator-common-util | patternFinder.js, connection.js, map.js |
 | 3 | Extract Handlebars from URI | Proceed | S | 1 | integrator-common-util | patternFinder.js:274–311 |
 | 4 | Widen identifier fallbacks | HTTP-scope | M | 4 | integrator-common-util | patternFinder.js:274–311 |
@@ -95,7 +95,7 @@ D1–D6 are **not** part of the ten proposed changes. They are existing bugs dis
 
 | # | Step |
 |---:|---|
-| 1 | Prerequisite: D1 fix merged first (new `templates` entries are dead config until then) |
+| 1 | Prerequisite scope (corrected): D1 gates **only template-based profiles** — `templates` entries are dead config until the consumer reads them. **Field-only entries (`fields: [...]`) flow through `prioritizeFields` today and can ship independently of D1** |
 | 2 | Add entries to map.js following the existing shape, e.g. `ebay: { fields: [...], templates: [] }` |
 | 3 | Starter profiles to validate: eBay (orderId, itemId, lineItemId, sku), Walmart (purchaseOrderId, wpid, sku, itemId), Slack (id, ts, channel), Gainsight (Gsid, id). Validate against 5–10 real response samples per connector — do not ship unvalidated fields |
 | 4 | Acceptance: map lookup returns the new profile; one unit test per connector shape |
@@ -107,11 +107,15 @@ D1–D6 are **not** part of the ten proposed changes. They are existing bugs dis
 <details>
 <summary><b>C2 · Detect Shopify/Amazon HTTP</b> — Needs sign-off on host detection table</summary>
 
-| Host rule | Resolves to |
+| Host rule (anchored, on the **parsed** hostname) | Resolves to |
 |---|---|
-| host contains `.myshopify.com` | shopify profile |
-| host matches `sellingpartnerapi-*.amazon.com` | new amazonsp profile |
-| host matches `mws.amazonservices.*` | amazonmws profile |
+| `hostname.endsWith('.myshopify.com')` | shopify profile |
+| `/^sellingpartnerapi(-[a-z]{2,4})?\.amazon\.com$/` (explicit regional variants) | new amazonsp profile |
+| `/^mws(\.[a-z-]+)?\.amazonservices\.[a-z.]+$/` | amazonmws profile |
+
+Parse `baseURI` with the URL API and match the extracted hostname **anchored** — never
+substring "contains" matching, which deceptive or malformed URLs (path segments, userinfo
+tricks) can spoof into a false connector classification.
 
 | # | Step |
 |---:|---|
@@ -139,6 +143,7 @@ D1–D6 are **not** part of the ten proposed changes. They are existing bugs dis
 | # | Step |
 |---:|---|
 | 1 | HTTP-only ordered list: uuid, externalId, key, ref, code, number, sku — appended after explicit/URI candidates in patternFinder.js:274–311 |
+| 1a | Case handling: runtime matching is **exact property-name** matching, so bare `uuid` misses `UUID`/`Uuid` and `sku` misses `SKU`. Generate case variants per name (the pattern the existing dictionary uses — 18 variants over 5 base names) or implement case-insensitive matching scoped to this HTTP list |
 | 2 | Never touch the global dictionary in tracekey-common |
 | 3 | Ship only after the C6 gate can reject non-unique candidates at runtime |
 
@@ -173,7 +178,7 @@ selectTraceKeyField(records, candidates, options)
 
 | # | Step |
 |---:|---|
-| 1 | Gate v1: accept a candidate only if distinct non-null values === non-null rows AND non-null coverage ≥ 90% of the page; else fall through; if none pass, null + reason. Applies at both batch points: adaptor `exportDataConverter` and flow-execution `injectTraceKeys` |
+| 1 | Gate v1: accept a candidate only if distinct non-null values === non-null rows AND non-null coverage ≥ 90% of the page (**90% is a proposed threshold, pending design review and shadow-mode data validation — see steps 5–6**); else fall through; if none pass, null + reason. Applies at both batch points: adaptor `exportDataConverter` and flow-execution `injectTraceKeys` |
 | 2 | Inferred keys only. User templates never blocked at runtime — preview warning with collision count; template enforcement requires Product approval |
 | 3 | Endpoint output: `{ traceKeysDuplicate, duplicateCount, source: template\|inferred, reason }` (responseTransformUtil.js:102–105, 129–141) |
 | 4 | UI: CeligoTraceKeyWarning shows collision count and source |
@@ -291,7 +296,10 @@ sample each to classify the remainder.
 
 **Follow-up required:** file a dedicated data spike ("Classify CF2 with-template blanks using
 D2 telemetry + ~10 template-to-record-shape sample joins"). Until it completes, deliverable 4
-status is: **mechanisms confirmed; production cause distribution pending follow-up**.
+status is: **mechanisms confirmed; production cause distribution pending follow-up**. Because
+the tracker explicitly asks for root cause, either complete the sampling before closing
+IO-208154 or keep the spike open with the linked follow-up **explicitly accepted by
+stakeholders** as the completion path.
 
 ### Fix mapping
 
