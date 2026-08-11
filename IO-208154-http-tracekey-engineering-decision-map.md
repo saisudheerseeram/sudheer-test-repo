@@ -221,6 +221,64 @@ getTraceKeyResult(record, template, traceKeyPattern, _flowId)
 
 ---
 
+## 4.6 CF 2.0 Template Evaluation Divergence — Root Cause (Spike Deliverable 4)
+
+**Question from the tracker:** why does CF 2.0 leave 20.1% of records blank when a trace-key
+template is configured, while legacy HTTP with a template blanks only 0.24%?
+
+**Conclusion:** there is **no separate CF 2.0 evaluation path**. CF2 and legacy HTTP stamp
+trace keys through the exact same evaluator — `getTraceKeyValueByTemplate()` in
+`tracekey-common/lib/tracekey/main.js` calling `hbUtil.evalExpressionSync(template, ctx, { strict: true })`.
+The divergence is not *how* templates are evaluated but *what they are evaluated against*,
+compounded by two defects that hide the failures.
+
+### The three mechanisms
+
+| # | Mechanism | What happens | Evidence |
+|---|---|---|---|
+| A | **Resource-wrapped records** | CF2 connectors emit records wrapped in a resource envelope (e.g. the record is `{ addon: {...} }`, so the id lives at `record.addon.id`). Users write `{{record.id}}` assuming the legacy shape, where the record *is* the resource. Under `strict: true`, the missing path fails the evaluation | CF2 response fixtures in http-adaptor; template strings joined to parsed record shapes |
+| B | **Strict failures collapse silently (D2)** | `evalExpressionSync` returns `{ value }` or `{ error }`. `main.js:201–211` passes the wrapper straight into `processTraceKey()`, so a strict-mode error becomes a null key with no log and no reason. Every wrong-path template from mechanism A turns into an invisible blank | main.js:201–211; no error telemetry exists for template failures today |
+| C | **Preview omits the pattern (D4)** | endpoint-service preview calls `getTraceKey(record, template)` without `traceKeyPattern` (responseTransformUtil.js:11), so design-time preview can disagree with production. Users have no signal at configure time that their template resolves to nothing in the real worker path | responseTransformUtil.js:11 vs worker path in flow-execution |
+
+A secondary context gap: legacy HTTP's Handlebars context (`oldContext.js:45–53`) exposes both
+`data.*` and root-level fields, while the bare `BaseHbDelegate` used in trace-key evaluation
+does not provide the `data.*` alias. Templates written as `{{data.id}}` — valid elsewhere in
+legacy HTTP — fail silently under trace-key evaluation for the same D2 reason.
+
+### What was ruled out
+
+- **A separate CF2 evaluator** — disproven by code reading; both cohorts funnel into the same
+  `tracekey-common` functions.
+- **The D1 `templates`/`template` contract defect** — does not explain this cohort. Explicit
+  user templates return *before* the map fallback, so the map contract never runs here.
+- **The D3 CF2 assistant-map bypass** — real, but it affects the **no-template** cohort
+  (77.34% blank), not the 20.14% with-template cohort.
+
+### Why the duplicate rate is also high (9.50% vs 1.50% legacy)
+
+The same wrong-shape templates that usually fail can partially resolve — e.g. a template with
+static text plus a field that is missing on most records evaluates to the same static-ish value
+repeatedly, producing collisions instead of blanks. Blank rate and duplicate rate are two
+symptoms of one cause: templates written against the wrong record shape.
+
+### Quantification — why the split isn't in this spike
+
+Splitting the 20.14% into "wrong path" vs "evaluation failure" is impossible from today's logs
+because mechanism B swallows the distinction: both cases land as the same null. The split
+becomes measurable once D2 ships (Phase 1) and error codes appear in telemetry. The C8
+start-work pack then joins ~10 CF2 exports' configured template strings to one parsed record
+sample each to classify the remainder.
+
+### Fix mapping
+
+| Fix | Phase | What it addresses |
+|---|---|---|
+| D2 — unwrap `{value, error}`, log error code, return reason | 1 | Makes mechanism B visible; enables the wrong-path vs eval-failure split |
+| D4 — thread `traceKeyPattern` through preview | 1 | Makes mechanism C honest; preview matches production |
+| Change 8 remainder — trace-key-only `data` alias in main.js:201–228 (preferred) or nested-path guidance in UI | 3 | Addresses mechanism A and the `data.*` context gap; approach chosen after D2 telemetry classifies the blanks |
+
+---
+
 ## 5. Release Plan — Phases in Shipping Order
 
 | Step | Phase | Risk | Ship | Notes |
