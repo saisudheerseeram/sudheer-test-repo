@@ -76,7 +76,7 @@ D1–D6 are **not** part of the ten proposed changes. They are existing bugs dis
 
 ---
 
-## 4.5 Start-Work Packs — everything an engineer needs to pick up each change
+## 4.1 Start-Work Packs — everything an engineer needs to pick up each change
 
 *Readiness legend: **Ready** = start today · **Needs input** = the listed decision/data must land first · **Blocked** = hard prerequisite.*
 
@@ -221,7 +221,7 @@ getTraceKeyResult(record, template, traceKeyPattern, _flowId)
 
 ---
 
-## 4.6 CF 2.0 Template Evaluation Divergence — Root Cause (Spike Deliverable 4)
+## 4.2 CF 2.0 Template Evaluation Divergence — Root Cause (Spike Deliverable 4)
 
 **Question from the tracker:** why does CF 2.0 leave 20.1% of records blank when a trace-key
 template is configured, while legacy HTTP with a template blanks only 0.24%?
