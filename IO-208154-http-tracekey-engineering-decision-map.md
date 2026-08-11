@@ -45,14 +45,14 @@ Fresh validation of all ten proposals against clean current-main clones, the lin
 
 D1–D6 are **not** part of the ten proposed changes. They are existing bugs discovered while verifying those proposals. Each needs its own Jira ticket.
 
-| Defect | Location & issue | Fix summary | What the fix solves |
-|---|---|---|---|
-| **D1** | Producer returns `templates` (patternFinder.js:113/143); consumer reads `template` (main.js:47–52) | Consumer accepts both keys; producer emits `template` (keep `templates` one release) | NetSuite (`{{Images.image_record_id}}`) and Zendesk (`{{name}}-{{email}}`) map templates start working; unblocks template-based Change 1 profiles (field-only profiles ship independently) |
-| **D2** | evalExpressionSync wrapper passed to processTraceKey (main.js:201–211); failures collapse to null | Unwrap wrapper; return null on error. Telemetry: aggregate **once per flow/template/reason** with a structured `logName` — never per-record warnings. **Never log raw template strings** (they can embed sensitive values) — log a template fingerprint (hash) plus the error code | Separates "template failed" from "field empty"; foundation for Change 10 and Change 8 attribution |
-| **D3** | Map lookup uses `assistant \|\| type`; CF2 connections often have no assistant (connection.js:5507–5517) | Resolve legacyId at pattern-build time when `_httpConnectorId` present | CF2 connectors inherit curated map profiles; attacks 77.34% CF2 no-template cohort |
-| **D4** | Preview calls getTraceKey without traceKeyPattern (responseTransformUtil.js:11) | Not a one-file fix: the pattern **originates** at design time (em-util → flow-management `getTraceKeyPattern`); the preview API contract must carry it into endpoint-service (processorService → responseTransformUtil), or endpoint-service must compute it from exportDoc + connection. Test **both** configured-template and no-template preview paths | Preview matches production for the **no-template** path (an explicit template short-circuits before pattern fallback — main.js:41–43 — so D4 does not affect the with-template cohort) |
-| **D5** | flowCache is unbounded array (main.js:21, 56–59); undercounts missing-key telemetry | Replace with a **bounded LRU** (defined max entries, evict least-recently-seen) or TTL-based cache — not merely a size-capped Set, which needs an eviction policy anyway; keep once-per-flow logging | Bounds worker memory; does **not** cause duplicates — only undercounts missing-key logs |
-| **D6** | Consumer version skew (8.0.1–8.0.19 across repos) | Publish tracekey-common → tracekey; bump identical pins every phase | Prevents design-time, preview, and production running different algorithms |
+| Defect | Module / Service | Location & issue | Fix summary | What the fix solves |
+|---|---|---|---|---|
+| **D1** | `integrator-common-util` — `utils/tracekey` (producer) + `utils/tracekey-common` (consumer); ships as `@celigo/tracekey` / `@celigo/tracekey-common` | Producer returns `templates` (patternFinder.js:113/143); consumer reads `template` (main.js:47–52) | Consumer accepts both keys; producer emits `template` (keep `templates` one release) | NetSuite (`{{Images.image_record_id}}`) and Zendesk (`{{name}}-{{email}}`) map templates start working; unblocks template-based Change 1 profiles (field-only profiles ship independently) |
+| **D2** | `integrator-common-util` — `utils/tracekey-common` (main.js) | evalExpressionSync wrapper passed to processTraceKey (main.js:201–211); failures collapse to null | Unwrap wrapper; return null on error. Telemetry: aggregate **once per flow/template/reason** with a structured `logName` — never per-record warnings. **Never log raw template strings** (they can embed sensitive values) — log a template fingerprint (hash) plus the error code | Separates "template failed" from "field empty"; foundation for Change 10 and Change 8 attribution |
+| **D3** | `em-util` + `flow-management` (getTraceKeyPattern path); connection schema read from `integrator-models` | Map lookup uses `assistant \|\| type`; CF2 connections often have no assistant (connection.js:5507–5517) | Resolve legacyId at pattern-build time when `_httpConnectorId` present | CF2 connectors inherit curated map profiles; attacks 77.34% CF2 no-template cohort |
+| **D4** | `endpoint-service` (processorService → responseTransformUtil) + the preview API contract with its caller | Preview calls getTraceKey without traceKeyPattern (responseTransformUtil.js:11) | Not a one-file fix: the pattern **originates** at design time (em-util → flow-management `getTraceKeyPattern`); the preview API contract must carry it into endpoint-service (processorService → responseTransformUtil), or endpoint-service must compute it from exportDoc + connection. Test **both** configured-template and no-template preview paths | Preview matches production for the **no-template** path (an explicit template short-circuits before pattern fallback — main.js:41–43 — so D4 does not affect the with-template cohort) |
+| **D5** | `integrator-common-util` — `utils/tracekey-common` (main.js flowCache) | flowCache is unbounded array (main.js:21, 56–59); undercounts missing-key telemetry | Replace with a **bounded LRU** (defined max entries, evict least-recently-seen) or TTL-based cache — not merely a size-capped Set, which needs an eviction policy anyway; keep once-per-flow logging | Bounds worker memory; does **not** cause duplicates — only undercounts missing-key logs |
+| **D6** | Release/DevOps process across all consumers: `em-util`, `flow-management`, `integrator-adaptor`, `flow-execution`, `integrator-workers`, `endpoint-service` | Consumer version skew (8.0.1–8.0.19 across repos) | Publish tracekey-common → tracekey; bump identical pins every phase | Prevents design-time, preview, and production running different algorithms |
 
 ---
 
@@ -329,6 +329,28 @@ This matrix records the audit verdict for each, making the validation auditable.
 | 7 | `api` is the only hardcoded URI exclusion | **Confirmed with modification** — `v1`/`v2` are already rejected by the alpha-only regex; `API` survives because the check is case-sensitive | patternFinder.js:286–309 | C9 | Final word-list review in PR |
 | 8 | No uniqueness check anywhere | **Confirmed** | `findTraceKey` stamps the first matching field, no distinctness validation | C5, C6 | Gate edge-case design (see C5/C6 packs) |
 | 9 | REST-to-HTTP conversion loses resource metadata | **Not verified in this spike** | REST routes to the same inference function, but the conversion path itself was not audited | — | **File a dedicated follow-up audit ticket** for the conversion path (what metadata existed pre-conversion, what survives on the HTTP doc) |
+
+---
+
+## 4.4 Module / Service Map — where each change lives (C1–C10)
+
+Repo → package/module for every change, plus the services that carry it to production.
+Changes to the `utils/tracekey*` packages reach production through the consumers listed in
+Section 8 (Deployment Chain); `http-adaptor` never needs product-code changes — it appears
+only as a test-fixture site for C7/C8.
+
+| Change | Repo · package/module (code changes) | Runs in / deploys via | Test-only involvement |
+|---|---|---|---|
+| C1 · Expand assistant map | `integrator-common-util` · `utils/tracekey-common` (map.js) + `utils/tracekey` (patternFinder.js prioritization) | flow-management (design-time), integrator-workers via adaptor/flow-execution (runtime), endpoint-service (preview) | flow-management getTraceKeyPattern tests |
+| C2 · Detect Shopify/Amazon HTTP | `integrator-common-util` · `utils/tracekey` (patternFinder.js host detection) + `utils/tracekey-common` (map.js amazonsp profile) | Same as C1 | `integrator-models` connection.js read as reference only — no schema change |
+| C3 · Extract Handlebars from URI | `integrator-common-util` · `utils/tracekey` (patternFinder.js:274–311) | Same as C1 | — |
+| C4 · Widen identifier fallbacks | `integrator-common-util` · `utils/tracekey` (patternFinder.js HTTP-only list) | Same as C1 | — |
+| C5 · Response-batch inference | `integrator-common-util` · `utils/tracekey-common` (new batchInference module) + `integrator-adaptor` (exportDataConverter.js) + `flow-execution` (injectTraceKeys) + `endpoint-service` (responseTransformUtil, processorService) | integrator-workers (runtime), endpoint-service + integrator-ui (preview) | — |
+| C6 · Pre-stamp uniqueness gate | Same four repos as C5 + `integrator-ui` (CeligoTraceKeyWarning, CeligoTraceKeysWrapper) | Same as C5 | — |
+| C7 · GraphQL support | `integrator-common-util` · `utils/tracekey` (patternFinder.js) + `utils/tracekey-common` (path verification) | Same as C1 | `http-adaptor` GraphQL scenarios (fixtures only); `integrator-models` formType read-only |
+| C8 · CF2 parity remainder | `integrator-common-util` · `utils/tracekey-common` (main.js:201–228 `data` alias) + `endpoint-service` (preview parity) | Same as C1 | `http-adaptor` CF2 response fixtures; `utils/adaptor-common` baseHBDelegate contract tests (no behavior change) |
+| C9 · Reduce noisy URI segments | `integrator-common-util` · `utils/tracekey` (patternFinder.js:286–309) | Same as C1 | — |
+| C10 · Explicit no-reliable-key state | `integrator-common-util` · `utils/tracekey-common` (getTraceKeyResult) + `integrator-adaptor` (abstractAdaptor, exportDataConverter) + `flow-execution` (qgmw.js, injectTraceKeys) + `endpoint-service` (preview contract) + `integrator-ui` (all-missing state) | integrator-workers (runtime), endpoint-service + integrator-ui (preview) | — |
 
 ---
 
