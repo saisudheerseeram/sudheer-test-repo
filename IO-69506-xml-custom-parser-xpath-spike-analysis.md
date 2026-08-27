@@ -256,7 +256,8 @@ Today:
 
 After flag on:
 
-* DOM evaluates the path. Records start flowing. Heap matches Automatic for that page (Workday Get_Workers pages in production are already in the ~8–10 MB Automatic range; this Custom flow's pages have been ~1 MB parsed JSON on similar OpenAir Custom traffic, but SOAP Worker XML can be larger).
+* DOM evaluates the path. Records start flowing.
+* Heap for that call matches Automatic (full XML loaded into a DOM). Workday Get_Workers SOAP pages on Automatic in production are already in the ~8–10 MB parsed-page range.
 
 #### Example 3: Simple Custom path `/AmazonEnvelope/.../Result`
 
