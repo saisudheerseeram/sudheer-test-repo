@@ -14,13 +14,19 @@ Custom XML parse strategy (`parserVersion` 1) uses a **streaming** engine that o
 
 That split was intentional (memory), not a UI bug. Supporting `//` on custom means paying Automatic's heap cost for those paths only.
 
-Snowflake (`DATA_ROOM.MONGODB.EXPORTS`, non-deleted XML HTTPExport): **19,442** docs. The fallback would change behavior for **29 custom + full-XPath** docs (21 export + 8 lookup) **after the flag is on**. The ~14.6k simple-absolute Automatic exports are unaffected.
+Snowflake (`DATA_ROOM.MONGODB.EXPORTS` / `SILVER.MONGODB.EXPORTS`, non-deleted XML HTTPExport): **19,442** docs. The fallback would change behavior for **29 custom + full-XPath** docs (21 export + 8 lookup) **after the flag is on**. That 29 is a **config population**, not 29 live flows:
+
+- **1 of 29** executed in the last 90 days (as of 2026-08-27).
+- **10 of 29** are attached to a non-deleted flow.
+- **1 of those 10 flows is enabled.** The other 9 attached flows are disabled. **19 of 29** are not on any live flow.
+
+The ~14.6k simple-absolute Automatic exports are unaffected.
 
 | Question | Answer |
 |---|---|
 | Why implemented this way? | Custom was built for large XML via streaming (`@celigo/parsers` XmlToJson). Streaming cannot evaluate real XPath; it does string-prefix matching on element paths. Automatic kept full XPath 1.0 via `xmldom-new` + `xpath`. |
 | Why does `//` not work on Custom? | `//` is a descendant axis. The streaming engine treats the path as a literal `/`-separated name. `//item` does not match `/data/item` in the stream, so `getNodes` returns empty. |
-| Impact if we support it? | Hybrid fallback: simple paths stay streaming; real XPath uses DOM. Memory for those paths matches Automatic (~25 MB XML → ~600 MB heap). Staged behind a flag. Production population at risk: **29** custom full-XPath docs. |
+| Impact if we support it? | Hybrid fallback: simple paths stay streaming; real XPath uses DOM. Memory for those paths matches Automatic (~25 MB XML → ~600 MB heap). Staged behind a flag. Config population at risk: **29** custom full-XPath docs. Live production traffic today: **1 enabled flow**. |
 
 ---
 
@@ -89,7 +95,7 @@ The two strategies share the same pipeline through `requestRobustly`. They diver
 | Area | Impact |
 |---|---|
 | Behavior (flag off) | None for Custom XPath (still empty). Scalar wrap (`count()` / `boolean()`) applies on DOM paths (Automatic); almost unused as `resourcePath`. `domRef` lazy-init crash fix is always on. |
-| Behavior (flag on) | **29** custom full-XPath exports/lookups start returning records instead of empty. Simple Custom paths unchanged. |
+| Behavior (flag on) | Config population of **29** custom full-XPath exports/lookups *would* start returning records instead of empty. Live traffic today is **1 enabled flow**. Simple Custom paths unchanged. |
 | Memory / CPU | Only Custom + real XPath pays Automatic's DOM cost for that call. Simple Custom and Amazon SP do not. Large XML + `//` on Custom can spike heap the same way Automatic already can. |
 | JSON shape | Custom stays lean; we do not switch those 29 to Automatic's verbose shape. |
 | `resourceIdPath` on Custom import | Still not evaluated per record (pre-existing Custom contract). Out of scope. |
@@ -157,7 +163,50 @@ Flag **off** (default): none of these rows change in production except the laten
 | export | GetNewOrdersResponse … `WEB_ORDER` | 1 |
 | export | `/*[local-name()='collection']/*[local-name()='SupplierConnectInvoice']` | 1 |
 
-### 5.3 Full XPath flavor mix (all strategies, 1,990 docs)
+### 5.3 Are those 29 on a flow, and did they run? (as of 2026-08-27)
+
+Sources: `SILVER.MONGODB.JOBS` (last 90 days, ~2026-05-29 → 2026-08-27) and `SILVER.MONGODB.FLOWS` (`deleted_at` is null). Flow attachment checked on `exportId`, `pageGenerators`, `pageProcessors`, `routers`, `childExports`, `exports`, and `runNextExportIds`. Lookups appear as a page-processor or router step with `_exportId`.
+
+| Slice of the 29 | Count |
+|---|---:|
+| Config population (custom + full XPath) | **29** (21 export + 8 lookup) |
+| Attached to a non-deleted flow | **10** |
+| Of those 10, flow is **enabled** | **1** |
+| Of those 10, flow is **disabled** | **9** |
+| Not on any live flow | **19** |
+| Executed in the last **90 days** | **1** |
+
+The 29 is a config count. Live fallback traffic today is **one enabled flow**.
+
+**The one that ran (and the only enabled flow)**
+
+| | |
+|---|---|
+| Export | Get employee terminations from Workday (`635849aa27114d57ab87d135`) |
+| Path | SOAP `/*[local-name()='Envelope']/.../'Worker'` |
+| Flow | Sync employee terminations from Workday to NetSuite (`635849aa27114d57ab87d13e`) — **enabled**, page generator |
+| Jobs in 90d | 128 |
+| Last job | 2026-08-26 20:06 UTC |
+
+**The other 9 attached docs sit on disabled flows** (turning the flow back on would start using the fallback):
+
+| Doc | Kind | Flow | Slot |
+|---|---|---|---|
+| 103.1 Shipments | export | 103.0 Dotcom to NetSuite - Shipments | page generator |
+| GET Employees from WORKDAY | export | WORKDAY (SOAP): Employees | page generator |
+| Get Amazon delivered shipments | export | Amazon Shipments to SAP S/4 HANA Fulfillments | page generator |
+| Get OpenAir project tasks (`//Read/Projecttask`) | export | OpenAir project tasks to Jira Cloud platform issues | page generator |
+| Get employees from Workday | export | Sync Employee Updates from Workday to NetSuite | page generator |
+| RobertTest | export | New flow | page generator |
+| Workday Ed SOAP | export | PoC Workday Ed SOAP | page generator |
+| Fetching the employee details | lookup | OLD FLOW - WorkDay workers to Litmos User | router |
+| Marian - Pixi SOAP Order Header | lookup | Celigo PoC Pixi -> Emarsys Emails | page processor |
+
+The two `//` exports (`//ReportInfo`, `//Read/Projecttask`) did **not** run in the last 90 days. `//Read/Projecttask` is on a disabled flow; `//ReportInfo` is not on a live flow.
+
+Lookups often do not get their own `JOBS` row (they run nested in an import). Splunk NA last 30 days also had 0 hits on the idle lookup IDs.
+
+### 5.4 Full XPath flavor mix (all strategies, 1,990 docs)
 
 Mostly SOAP `local-name()` and `//` descendants. Almost no `text()` / `@attr` on resource path.
 
@@ -203,4 +252,4 @@ Also re-run Automatic vs Custom on the same payload (shape still differs: verbos
 - Flag: `XML_CUSTOM_PARSER_XPATH_FALLBACK_ENABLED` in `env.yaml` (`devops_configured: true`)
 - Decision record in http-adaptor: `docs/decisions/2026-08-26-xml-custom-parser-xpath-hybrid-fallback.md`
 
-Rollout: merge with flag unset → enable on QA → confirm `//item` / `local-name()` → enable production. Watch heap on XML-heavy Custom + XPath flows after enable.
+Rollout: merge with flag unset → enable on QA → confirm `//item` / `local-name()` → enable production. Watch heap on XML-heavy Custom + XPath flows after enable. The only live production flow in the 29 today is Workday employee terminations (SOAP `local-name()` Worker path).
