@@ -1,175 +1,169 @@
-# IO-69506 · XML Custom Parser XPath Spike Analysis
+# IO-69506 Spike: Custom XML Parse Strategy Does Not Evaluate Real XPath
 
 Spike: [IO-69506](https://celigo.atlassian.net/browse/IO-69506)  
 Story: [IO-37388](https://celigo.atlassian.net/browse/IO-37388)  
 Epic: [IO-47804](https://celigo.atlassian.net/browse/IO-47804)
 
-**Suggested implementation PR:** [celigo/http-adaptor#1975](https://github.com/celigo/http-adaptor/pull/1975) — hybrid DOM fallback for real XPath on custom XML parsers, gated by `XML_CUSTOM_PARSER_XPATH_FALLBACK_ENABLED` (default **off**).
+**Suggested implementation PR:** [celigo/http-adaptor#1975](https://github.com/celigo/http-adaptor/pull/1975)
 
 ---
 
-## 1. Executive summary
+## Summary
 
-Custom XML parse strategy (`parserVersion` 1) uses a **streaming** engine that only matches literal element paths (`/data/item`). Real XPath (`//item`, `//*[local-name()='item']`, `text()`, predicates) returns **empty results with no error**. Automatic strategy (`parserVersion` 0) uses a **DOM + xpath** engine and those expressions work.
+For HTTP exports and lookups with XML **Custom** parse strategy (`parserVersion` 1), real XPath on `resourcePath` / success path / paging paths returns **empty results with no error**.
 
-That split was intentional (memory), not a UI bug. Supporting `//` on custom means paying Automatic's heap cost for those paths only.
+The same expression works on **Automatic** (`parserVersion` 0) because Automatic uses a DOM + `xpath.select` engine.
 
-Snowflake (`DATA_ROOM.MONGODB.EXPORTS` / `SILVER.MONGODB.EXPORTS`, non-deleted XML HTTPExport): **19,442** docs. The fallback would change behavior for **29 custom + full-XPath** docs (21 export + 8 lookup) **after the flag is on**. That 29 is a **config population**, not 29 live flows:
+Custom uses a streaming engine (`@celigo/parsers` XmlToJson) that only matches literal element paths such as `/data/item`. It does not evaluate `//`, `local-name()`, `text()`, predicates, wildcards, or attributes.
 
-- **1 of 29** executed in the last 90 days (as of 2026-08-27).
-- **10 of 29** are attached to a non-deleted flow.
-- **1 of those 10 flows is enabled.** The other 9 attached flows are disabled. **19 of 29** are not on any live flow.
+The two strategies share the same pipeline through `requestRobustly`. They diverge **inside** `XmlParser`, including on the success-path check that still runs *inside* `requestRobustly` after the HTTP response is back.
 
-The ~14.6k simple-absolute Automatic exports are unaffected.
+## Customer Impact
 
-| Question | Answer |
-|---|---|
-| Why implemented this way? | Custom was built for large XML via streaming (`@celigo/parsers` XmlToJson). Streaming cannot evaluate real XPath; it does string-prefix matching on element paths. Automatic kept full XPath 1.0 via `xmldom-new` + `xpath`. |
-| Why does `//` not work on Custom? | `//` is a descendant axis. The streaming engine treats the path as a literal `/`-separated name. `//item` does not match `/data/item` in the stream, so `getNodes` returns empty. |
-| Impact if we support it? | Hybrid fallback: simple paths stay streaming; real XPath uses DOM. Memory for those paths matches Automatic (~25 MB XML → ~600 MB heap). Staged behind a flag. Config population at risk: **29** custom full-XPath docs. Live production traffic today: **1 enabled flow**. |
+* Switching parse strategy from Automatic to Custom with a path like `//item` or `//*[local-name()='item']` makes preview and export pages show `0 Pages, 0 Records`.
+* There is no `invalid_xpath` unless the expression is illegal for the DOM engine (for example `/data/item.text()` is JS-style, not XPath; the valid form is `/data/item/text()`).
+* Success / fail path, resource path, and paging XPaths on Custom can all silently miss.
+* Snowflake config population for this bug: **29** non-deleted XML HTTPExport docs with Custom + full XPath (21 export + 8 lookup).
+* Live traffic is much smaller: **1 of 29** executed in the last 90 days. **10 of 29** are attached to a flow. **1 of those 10 flows is enabled.**
 
----
+## Root Cause
 
-## 2. Why it was implemented that way
+The root cause is an engine split inside `http-adaptor/src/parsers/XmlParser.js`, decided by `commonUtil.getParserVersion(doc.parsers)`.
 
-`XmlParser` has two engines. Dispatch is `commonUtil.getParserVersion(doc.parsers)`:
+This was intentional for memory, not a UI bug. Custom was added so large vendor XML would not OOM the adaptor. Automatic kept full XPath 1.0.
 
-- **Automatic (`parserVersion` 0)** — no xml parser `version: 1` on the doc. Full document loaded into a DOM (`xmldom-new`). `xpath.select` evaluates XPath 1.0 (`//`, predicates, `local-name()`, `text()`, `@attr`, unions).
-- **Custom (`parserVersion` 1)** — `parsers` contains `{ type: 'xml', version: 1 }`. Streaming `XmlToJson` from `@celigo/parsers`. Walks the document once, emits JSON when the current element path equals `resourcePath`. That is **not** an XPath engine.
+### Automatic path
 
-Amazon SP (`simpleXpathsOnly`) always stays on streaming, even after this change.
+Automatic (`parserVersion` 0) has no `{ type: 'xml', version: 1 }` on `doc.parsers`.
 
-**Why two engines existed**
+It loads the full response body into a DOM (`xmldom-new`) and calls `xpath.select(path, doc)`.
 
-1. **Memory.** Code in `getResourcesFromResponse` documents ~25 MB XML → ~600 MB of DOM nodes in heap. Streaming was added so large vendor XML (Amazon, Walmart, etc.) would not OOM the adaptor.
-2. **Custom JSON shape.** Custom configs (`listNodes`, `includePaths`, `excludePaths`, lean JSON) live in the streaming parser. Automatic emits verbose `{ Name: [{ _: 'John' }] }`. Custom emits `{ Name: 'John' }`.
-3. **UI mismatch.** The resource-path field is labeled "XPath" for both strategies. Automatic honors XPath. Custom only honors a subset that *looks* like XPath (`/a/b/c`). Users switching Automatic → Custom with `//item` see empty preview and empty export pages — the IO-69506 repro.
+That is real XPath 1.0, so `//item`, `*[local-name()='Worker']`, `text()`, `@attr`, and unions work.
 
-Related history: IO-30688, IO-29907, IO-28911, IO-45527, IO-45554, PRODUCT-1391.
+JSON shape is verbose, for example `{ Name: [{ _: 'John' }] }`.
 
----
+### Custom path
 
-## 3. Why `//` (and other real XPath) does not work on Custom
+Custom (`parserVersion` 1) means `parsers` contains `{ type: 'xml', version: 1 }`.
 
 Until the fallback runs, Custom never calls `xpath.select`. Flow:
 
-```
-getNodes / getResourcesFromResponse
-  if parserVersion === 1 || simpleXpathsOnly
-    formatSimplePath(path)     // only prepends "/" if missing
-    XmlToJson.parseChunk(body) // literal path match on currentPath
-```
+* `formatSimplePath(path)` only prepends `/` if missing
+* `XmlToJson.parseChunk(body)` compares the stream's current element path (for example `/data/item`) to `resourcePath`
 
-`XmlToJson` compares the stream's current element path (e.g. `/data/item`) to `resourcePath`. It does not implement:
+That is **not** an XPath engine. It does string-prefix matching on element names.
 
 | Syntax | Meaning | Streaming result |
 |---|---|---|
-| `//item` | descendant-or-self | no match — looks for a child named empty then `item` |
-| `//*[local-name()='item']` | any element named `item`, ignore namespace | unsupported functions/predicates |
+| `//item` | descendant-or-self | no match |
+| `//*[local-name()='item']` | any element named `item`, ignore namespace | unsupported |
 | `/data/item/text()` | text node | unsupported |
 | `/data/item[1]`, `@id`, `*`, `\|` | predicates, attributes, wildcards, unions | unsupported |
 
-**Silent empty, not an exception.** The stream finishes with zero records. Preview shows `0 Pages, 0 Records` without `invalid_xpath` unless the path is illegal for the *DOM* engine (e.g. `/data/item.text()` — JS-style, not XPath; use `/data/item/text()`).
+Simple `/a/b/c` happens to look like XPath and works. The UI labels the field "XPath" for both strategies, which is the mismatch.
 
-Automatic works because `xpath.select('//item', doc)` is real XPath 1.0.
+Amazon SP (`simpleXpathsOnly`) always stays on streaming, even after this change.
 
-The two strategies share the same pipeline through `requestRobustly`. They diverge **inside** `XmlParser` on `parserVersion` / `simpleXpathsOnly`.
+### Why this is not a `requestRobustly` fork
 
----
+Request build, signing, and the axios call are shared.
 
-## 4. If we need to support it — what is the impact?
+The first parser call can still happen **inside** `requestRobustly`:
 
-**Option chosen (PR #1975):** hybrid fallback, not "put XPath into the streaming engine" and not "run Custom entirely on DOM".
+* `isSuccessfulResponse`
+* `containsPathAndValues`
+* `parser.getNodes(successPath)`
 
-| Path | Engine after the change (flag **on**) |
-|---|---|
-| Custom + `/data/item` (simple) | Streaming — unchanged memory |
-| Custom + `//item`, `local-name()`, `text()`, `@`, `*`, `[ ]` | DOM select, then convert nodes with the **custom** config so JSON stays lean |
-| Automatic | DOM — unchanged |
-| Amazon SP `simpleXpathsOnly` | Streaming — never DOM |
+If Custom + complex XPath is used as a success path, the empty result happens before `requestRobustly` callbacks.
 
-**Flag:** `XML_CUSTOM_PARSER_XPATH_FALLBACK_ENABLED` (nconf). Default **off** = merge is behavior-neutral. Enable per environment (QA first).
+Record extraction (`getResourcesFromResponse`), paging `getNodes`, and import `processSubmitResponse` use the same `XmlParser` methods **after** the call.
 
-### Impact
+## Code Flow
 
-| Area | Impact |
-|---|---|
-| Behavior (flag off) | None for Custom XPath (still empty). Scalar wrap (`count()` / `boolean()`) applies on DOM paths (Automatic); almost unused as `resourcePath`. `domRef` lazy-init crash fix is always on. |
-| Behavior (flag on) | Config population of **29** custom full-XPath exports/lookups *would* start returning records instead of empty. Live traffic today is **1 enabled flow**. Simple Custom paths unchanged. |
-| Memory / CPU | Only Custom + real XPath pays Automatic's DOM cost for that call. Simple Custom and Amazon SP do not. Large XML + `//` on Custom can spike heap the same way Automatic already can. |
-| JSON shape | Custom stays lean; we do not switch those 29 to Automatic's verbose shape. |
-| `resourceIdPath` on Custom import | Still not evaluated per record (pre-existing Custom contract). Out of scope. |
-| Amazon SP | Exempt. |
+### Common flow
 
-### What we did **not** do
+1. Worker / agent sends `getNextPage` (export) or import / lookup submit.
+2. `httpAdaptorCore.requestRobustly()` fills handlebars, signs, and makes the HTTP call.
+3. After the body is back, `isSuccessfulResponse()` may call `parser.getNodes()` for success / fail path.
+4. The adaptor then extracts records or paging tokens via `getResourcesFromResponse` / `getNodes`.
 
-- Teach streaming XmlToJson full XPath (large, wrong layer).
-- Force all Custom through DOM (would regress memory for the 231 simple-absolute Custom docs).
+### Automatic flow
 
----
+1. `getParserVersion` returns 0.
+2. `getNodes` builds a DOM and runs `xpath.select`.
+3. Nodes become verbose JSON.
 
-## 5. Production path inventory (Snowflake)
+### Custom flow (today, flag off)
 
-Source: `DATA_ROOM.MONGODB.EXPORTS`  
-Filter: `deletedAt IS NULL`, `http.successMediaType = xml`, `adaptorType = HTTPExport`  
-**Custom** = `parsers` contains `{ type: xml, version: 1 }`  
-Path field: `http.response.resourcePath`  
-Classification matches `isSimplePath` in `src/parsers/XmlParser.js`.
+1. `getParserVersion` returns 1.
+2. `getNodes` / `getResourcesFromResponse` always take the streaming branch.
+3. If the path is not a literal element path, the stream emits zero records.
+4. Preview and the export page look empty. No exception.
 
-Total: **19,442** XML HTTPExport docs (exports + lookups).
+## Additional Behavior Note: memory
 
-### 5.1 Path types × strategy × does PR #1975 affect them?
+Code in `getResourcesFromResponse` documents that ~25 MB of complex XML can expand to ~600 MB of DOM nodes in heap.
 
-| Path type | Strategy | Count | Example | Affected by PR? |
-|---|---|---:|---|---|
-| Simple absolute (`/a/b/c`) | automatic | **14,619** | `/AmazonEnvelope/Message/ProcessingReport/Result` | **No** — already DOM |
-| Simple absolute | custom | **231** | `/AmazonEnvelope/Message/return_details` | **No** — still streaming |
-| Simple relative (`a/b/c`) | automatic | **845** | `response/Read/Project` | **No** |
-| Simple relative | custom | **4** | `s:Envelope` | **No** — still streaming (`:` is a simple segment) |
-| Root (`/`) | automatic | **1,151** | `/` | **No** |
-| Root | custom | **576** | `/` | **No** |
-| Missing | automatic | **17** | *(empty)* | **No** |
-| Missing | custom | **2** | *(empty)* | **No** |
-| Other / invalid | automatic | **7** | `\`, spaces in path, `TBD - pending…` | **No** |
-| Full XPath: `local-name()` | automatic | **1,493** | `/*[local-name()='Envelope']/…/'Worker'` | **No** — already works |
-| Full XPath: `local-name()` | custom | **27** | same Envelope/Body/Worker path | **Yes if flag on** — empty today |
-| Full XPath: `//` descendant | automatic | **407** | `//ReportInfo` | **No** |
-| Full XPath: `//` descendant | custom | **2** | `//Read/Projecttask` | **Yes if flag on** |
-| Full XPath: `text()` | automatic | **14** | `/RequestReportResponse/…/ReportRequestId/text()` | **No** |
-| Full XPath: `text()` | custom | **0** | — | — |
-| Full XPath: `*` wildcard | automatic | **42** | `/*` or `*` | **No** |
-| Full XPath: `*` wildcard | custom | **0** | — | — |
-| Full XPath: predicate `[1]` | automatic | **4** | `…/member[1]/value/i4` | **No** |
-| Full XPath: `@attr` | automatic | **1** | `/SubmitOrder/Order[@Id]` | **No** |
-| Full XPath: `@attr` | custom | **0** | — | — |
+That is why Custom streaming exists. Supporting `//` on Custom means paying Automatic's heap cost **for those paths only**. Simple Custom paths should stay streaming.
 
-**Custom + full XPath = 29** (27 `local-name()` + 2 `//`). That is the population the flag is for.
+## Permanent Fix Options
 
-Flag **off** (default): none of these rows change in production except the latent `domRef` crash fix and rare Automatic `count()`/`boolean()` success-path wrapping.
+### Option 1: Hybrid DOM fallback for Custom + real XPath
 
-### 5.2 Custom + full XPath paths (the 29)
+Recommended. Implemented in [PR #1975](https://github.com/celigo/http-adaptor/pull/1975).
 
-| Kind | Path | n |
-|---|---|---:|
-| export | `/*[local-name()='Envelope']/…/'Worker'` | 11 |
-| lookup | same Worker path | 6 |
-| export | `//*[local-name() = 'ShipmentData']/*[local-name() = 'member']` | 3 |
-| export | `/*[local-name()='Envelope']/…/'getReportJobStatusResponse'` | 2 |
-| lookup | same getReportJobStatusResponse | 1 |
-| export | `/*[local-name()='response']/…/'shipment'` | 1 |
-| export | `//Read/Projecttask` | 1 |
-| export | `//ReportInfo` | 1 |
-| lookup | pixiGetOrderHeader … `local-name()` chain | 1 |
-| export | GetNewOrdersResponse … `WEB_ORDER` | 1 |
-| export | `/*[local-name()='collection']/*[local-name()='SupplierConnectInvoice']` | 1 |
+After classifying the path with `isSimplePath`:
 
-### 5.3 Are those 29 on a flow, and did they run? (as of 2026-08-27)
+* Custom + `/data/item` stays on streaming.
+* Custom + `//item`, `local-name()`, `text()`, `@`, `*`, `[ ]` uses DOM `xpath.select`, then converts matched nodes with the **custom** parser config so JSON stays lean.
+* Automatic stays DOM.
+* Amazon SP `simpleXpathsOnly` never uses DOM.
 
-Sources: `SILVER.MONGODB.JOBS` (last 90 days, ~2026-05-29 → 2026-08-27) and `SILVER.MONGODB.FLOWS` (`deleted_at` is null). Flow attachment checked on `exportId`, `pageGenerators`, `pageProcessors`, `routers`, `childExports`, `exports`, and `runNextExportIds`. Lookups appear as a page-processor or router step with `_exportId`.
+The fallback is gated by `XML_CUSTOM_PARSER_XPATH_FALLBACK_ENABLED` (nconf, `env.yaml`, `devops_configured: true`). Default **off**.
+
+Pros:
+
+* Fixes the empty-results bug without putting a full XPath engine into the streamer.
+* Simple Custom paths keep today's memory profile.
+* Custom JSON stays lean. The 29 docs are not switched to Automatic's verbose shape.
+* Flag-off merge is behavior-neutral for Custom XPath.
+
+Cons:
+
+* Custom + real XPath pays Automatic heap for that call. Large XML + `//` can OOM the same way Automatic already can.
+* Needs staged enablement.
+
+### Option 2: Teach streaming XmlToJson full XPath
+
+Put descendant axes, predicates, and functions into `@celigo/parsers`.
+
+Pros:
+
+* Stays streaming for large files.
+
+Cons:
+
+* Large change in the wrong layer. Streaming XmlToJson is a path matcher, not an XPath engine.
+
+### Option 3: Run all Custom through DOM
+
+Pros:
+
+* One engine. XPath always works.
+
+Cons:
+
+* Regresses memory for **231** simple-absolute Custom docs that are fine on streaming today.
+
+## Production Impact of the 29 (as of 2026-08-27)
+
+Source: Snowflake `SILVER.MONGODB.EXPORTS` (same Custom + full-XPath filter), `SILVER.MONGODB.JOBS` (last 90 days), `SILVER.MONGODB.FLOWS` (non-deleted).
+
+Total XML HTTPExport docs: **19,442**. Custom + full XPath: **29**.
 
 | Slice of the 29 | Count |
 |---|---:|
-| Config population (custom + full XPath) | **29** (21 export + 8 lookup) |
+| Config population | **29** (21 export + 8 lookup) |
 | Attached to a non-deleted flow | **10** |
 | Of those 10, flow is **enabled** | **1** |
 | Of those 10, flow is **disabled** | **9** |
@@ -178,78 +172,130 @@ Sources: `SILVER.MONGODB.JOBS` (last 90 days, ~2026-05-29 → 2026-08-27) and `S
 
 The 29 is a config count. Live fallback traffic today is **one enabled flow**.
 
-**The one that ran (and the only enabled flow)**
+**The one that ran**
 
-| | |
-|---|---|
-| Export | Get employee terminations from Workday (`635849aa27114d57ab87d135`) |
-| Path | SOAP `/*[local-name()='Envelope']/.../'Worker'` |
-| Flow | Sync employee terminations from Workday to NetSuite (`635849aa27114d57ab87d13e`) — **enabled**, page generator |
-| Jobs in 90d | 128 |
-| Last job | 2026-08-26 20:06 UTC |
+* Export: Get employee terminations from Workday (`635849aa27114d57ab87d135`)
+* Path: SOAP `/*[local-name()='Envelope']/.../'Worker'`
+* Flow: Sync employee terminations from Workday to NetSuite (`635849aa27114d57ab87d13e`) — **enabled**, page generator
+* 128 jobs in 90 days. Last job: 2026-08-26 20:06 UTC
 
-**The other 9 attached docs sit on disabled flows** (turning the flow back on would start using the fallback):
+The other 9 attached docs sit on disabled flows. Turning those flows back on would start using the fallback.
 
-| Doc | Kind | Flow | Slot |
-|---|---|---|---|
-| 103.1 Shipments | export | 103.0 Dotcom to NetSuite - Shipments | page generator |
-| GET Employees from WORKDAY | export | WORKDAY (SOAP): Employees | page generator |
-| Get Amazon delivered shipments | export | Amazon Shipments to SAP S/4 HANA Fulfillments | page generator |
-| Get OpenAir project tasks (`//Read/Projecttask`) | export | OpenAir project tasks to Jira Cloud platform issues | page generator |
-| Get employees from Workday | export | Sync Employee Updates from Workday to NetSuite | page generator |
-| RobertTest | export | New flow | page generator |
-| Workday Ed SOAP | export | PoC Workday Ed SOAP | page generator |
-| Fetching the employee details | lookup | OLD FLOW - WorkDay workers to Litmos User | router |
-| Marian - Pixi SOAP Order Header | lookup | Celigo PoC Pixi -> Emarsys Emails | page processor |
+The two `//` exports (`//ReportInfo`, `//Read/Projecttask`) did **not** run in the last 90 days.
 
-The two `//` exports (`//ReportInfo`, `//Read/Projecttask`) did **not** run in the last 90 days. `//Read/Projecttask` is on a disabled flow; `//ReportInfo` is not on a live flow.
+~14.6k simple-absolute Automatic exports are unaffected.
 
-Lookups often do not get their own `JOBS` row (they run nested in an import). Splunk NA last 30 days also had 0 hits on the idle lookup IDs.
-
-### 5.4 Full XPath flavor mix (all strategies, 1,990 docs)
-
-Mostly SOAP `local-name()` and `//` descendants. Almost no `text()` / `@attr` on resource path.
-
-| Flavor | Approx. count |
-|---|---:|
-| `local-name()` + `*` (no `//`) | ~1,108 |
-| `//` + `local-name()` | ~410 |
-| `//` only (e.g. `//ReportInfo`) | ~407 |
-| `*` only | ~42 |
-| `text()` | ~16 |
-| `@attr` | ~2 |
-
-This inventory is **resourcePath only**. Success/fail paths are a separate field and were not counted here.
-
----
-
-## 6. How to test
+## Recommended Tests
 
 Unit tests: `__tests__/unit/parsers/xmlParser.test.js` (IO-69506 block), including flag on/off.
 
 QA preview (Custom, flag on):
 
-| Resource path | Expected |
-|---|---|
-| `/data/item` | 2 lean records (streaming) |
-| `//item` | 2 lean records (was empty) |
-| `//*[local-name()='item']` | same |
-| `/data/item/text()` | valid XPath; **not** `/data/item.text()` |
-| `count(//item)` | `[2]` |
-| `/data/item.text()` | `invalid_xpath` (illegal syntax) |
+1. `/data/item` — 2 lean records (streaming, unchanged)
+2. `//item` — 2 lean records (was empty)
+3. `//*[local-name()='item']` — same
+4. `/data/item/text()` — valid XPath; **not** `/data/item.text()`
+5. `count(//item)` — `[2]`
+6. `/data/item.text()` — `invalid_xpath`
 
 Flag off: `//item` empty again; `/data/item` still works.
 
-Also re-run Automatic vs Custom on the same payload (shape still differs: verbose vs lean).
+Also re-run Automatic vs Custom on the same payload. Shape still differs: verbose vs lean.
 
----
+## Backward Compatibility Considerations
 
-## 7. Suggested PR
+The backward compatibility risk is real and should be treated carefully.
 
-**https://github.com/celigo/http-adaptor/pull/1975**
+Users who are working correctly today are typically in one of these cases:
 
-- Branch: `IO-69506-xml-custom-xpath-fallback` from `main`
-- Flag: `XML_CUSTOM_PARSER_XPATH_FALLBACK_ENABLED` in `env.yaml` (`devops_configured: true`)
-- Decision record in http-adaptor: `docs/decisions/2026-08-26-xml-custom-parser-xpath-hybrid-fallback.md`
+* They use Automatic, so XPath already works.
+* They use Custom with a simple path `/a/b/c`, so streaming already matches.
+* They use Amazon SP (`simpleXpathsOnly`), which stays on streaming.
 
-Rollout: merge with flag unset → enable on QA → confirm `//item` / `local-name()` → enable production. Watch heap on XML-heavy Custom + XPath flows after enable. The only live production flow in the 29 today is Workday employee terminations (SOAP `local-name()` Worker path).
+The category this change is for:
+
+* Custom parse strategy
+* `resourcePath` / success path / paging path is real XPath (`//`, `local-name()`, etc.)
+* They currently get empty results
+
+That is the 29 docs. After the flag is on, those docs start returning records instead of empty. That is the intended fix, but it is still a behavior change.
+
+### Risks if the fallback is enabled globally with no flag
+
+Even though only Custom + complex paths change:
+
+* A Custom + `//` export on a large XML body loads the full DOM (Automatic heap).
+* A flow that was "working" with zero records (disabled, unused, or wrongly assumed empty) could start emitting records.
+* Custom import `resourceIdPath` is still not evaluated per record. That is a pre-existing Custom contract and is out of scope.
+
+### Examples
+
+#### Example 1: Customer switched Automatic → Custom with `//item`
+
+Today:
+
+* Preview shows 0 records.
+* They believe Custom is broken.
+
+After flag on:
+
+* Preview and export return lean records.
+* This is the IO-69506 repro. Correct fix.
+
+#### Example 2: Live Workday Custom SOAP export
+
+Configuration:
+
+* Custom parser
+* `local-name()` Worker path
+* Enabled flow: Sync employee terminations from Workday to NetSuite
+
+Today:
+
+* Streaming does not match the SOAP path, so pages can be empty.
+
+After flag on:
+
+* DOM evaluates the path. Records start flowing. Heap matches Automatic for that page (Workday Get_Workers pages in production are already in the ~8–10 MB Automatic range; this Custom flow's pages have been ~1 MB parsed JSON on similar OpenAir Custom traffic, but SOAP Worker XML can be larger).
+
+#### Example 3: Simple Custom path `/AmazonEnvelope/.../Result`
+
+Today and after flag on:
+
+* Still streaming. No behavior change. This is the 231 simple-absolute Custom docs.
+
+### Compatibility conclusion
+
+A global Custom XPath behavior change without rollout control is not recommended.
+
+The safest interpretation is:
+
+* Automatic and Custom stay separate engines.
+* Custom simple paths keep streaming by default.
+* Custom real XPath should use DOM only when an explicit guard is on.
+* Amazon SP stays streaming unconditionally.
+
+### Recommended rollout approach
+
+1. Keep Custom + simple path working with no change (no customer workaround required for `/a/b/c`).
+2. Merge the hybrid fallback with the flag **off** (PR #1975).
+3. Enable `XML_CUSTOM_PARSER_XPATH_FALLBACK_ENABLED` on QA. Confirm `//item` and `local-name()`.
+4. Enable production. Watch heap on Custom + XPath flows. The only live production flow in the 29 today is Workday employee terminations.
+
+Recommended default position:
+
+* Do not change Custom XPath behavior by default.
+* Use the flag for staged enablement.
+* Do not force all Custom through DOM.
+
+This preserves working Custom streaming configurations while allowing impacted XPath users to be unblocked when the flag is on.
+
+## Current Workaround / Unblock
+
+Until the flag is on:
+
+* Switch the parse strategy back to **Automatic** if the path is real XPath. Automatic already evaluates `xpath.select`.
+* Or change Custom `resourcePath` to a literal element path the streamer can match, for example `/data/item` instead of `//item`.
+* Do not use JS-style `/data/item.text()`. Use `/data/item/text()`.
+
+Workaround trade-off: Automatic returns verbose JSON and uses more heap. Custom simple paths stay lean and streaming.
