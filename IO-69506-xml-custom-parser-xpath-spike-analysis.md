@@ -14,19 +14,13 @@ Custom XML parse strategy (`parserVersion` 1) uses a **streaming** engine that o
 
 That split was intentional (memory), not a UI bug. Supporting `//` on custom means paying Automatic's heap cost for those paths only.
 
-Snowflake (`DATA_ROOM.MONGODB.EXPORTS` / `SILVER.MONGODB.EXPORTS`, non-deleted XML HTTPExport): **19,442** docs. The fallback would change behavior for **29 custom + full-XPath** docs (21 export + 8 lookup) **after the flag is on**. That 29 is a **config population**, not 29 live flows:
-
-- **1 of 29** executed in the last 90 days (as of 2026-08-27).
-- **10 of 29** are attached to a non-deleted flow.
-- **1 of those 10 flows is enabled.** The other 9 attached flows are disabled. **19 of 29** are not on any live flow.
-
-The ~14.6k simple-absolute Automatic exports are unaffected.
+Snowflake (`DATA_ROOM.MONGODB.EXPORTS`, non-deleted XML HTTPExport): **19,442** docs. The ~14.6k simple-absolute Automatic exports are unaffected.
 
 | Question | Answer |
 |---|---|
 | Why implemented this way? | Custom was built for large XML via streaming (`@celigo/parsers` XmlToJson). Streaming cannot evaluate real XPath; it does string-prefix matching on element paths. Automatic kept full XPath 1.0 via `xmldom-new` + `xpath`. |
 | Why does `//` not work on Custom? | `//` is a descendant axis. The streaming engine treats the path as a literal `/`-separated name. `//item` does not match `/data/item` in the stream, so `getNodes` returns empty. |
-| Impact if we support it? | Hybrid fallback: simple paths stay streaming; real XPath uses DOM. Memory for those paths matches Automatic (~25 MB XML → ~600 MB heap). Staged behind a flag. Config population at risk: **29** custom full-XPath docs. Live production traffic today: **1 enabled flow**. |
+| Impact if we support it? | Hybrid fallback: simple paths stay streaming; real XPath uses DOM. Memory for those paths matches Automatic (~25 MB XML → ~600 MB heap). Staged behind a flag. Production population at risk: **29** custom full-XPath docs. |
 
 ---
 
@@ -95,7 +89,7 @@ The two strategies share the same pipeline through `requestRobustly`. They diver
 | Area | Impact |
 |---|---|
 | Behavior (flag off) | None for Custom XPath (still empty). Scalar wrap (`count()` / `boolean()`) applies on DOM paths (Automatic); almost unused as `resourcePath`. `domRef` lazy-init crash fix is always on. |
-| Behavior (flag on) | Config population of **29** custom full-XPath exports/lookups *would* start returning records instead of empty. Live traffic today is **1 enabled flow**. Simple Custom paths unchanged. |
+| Behavior (flag on) | **29** custom full-XPath exports/lookups start returning records instead of empty. Simple Custom paths unchanged. |
 | Memory / CPU | Only Custom + real XPath pays Automatic's DOM cost for that call. Simple Custom and Amazon SP do not. Large XML + `//` on Custom can spike heap the same way Automatic already can. |
 | JSON shape | Custom stays lean; we do not switch those 29 to Automatic's verbose shape. |
 | `resourceIdPath` on Custom import | Still not evaluated per record (pre-existing Custom contract). Out of scope. |
@@ -105,6 +99,12 @@ The two strategies share the same pipeline through `requestRobustly`. They diver
 
 - Teach streaming XmlToJson full XPath (large, wrong layer).
 - Force all Custom through DOM (would regress memory for the 231 simple-absolute Custom docs).
+
+The fallback would change behavior for **29** custom + full-XPath docs (21 export + 8 lookup) after the flag is on. That 29 is a **config population**, not 29 live flows:
+
+- **1 of 29** executed in the last 90 days (as of 2026-08-27).
+- **10 of 29** are attached to a non-deleted flow.
+- **1 of those 10 flows is enabled.** The other 9 attached flows are disabled. **19 of 29** are not on any live flow.
 
 ---
 
