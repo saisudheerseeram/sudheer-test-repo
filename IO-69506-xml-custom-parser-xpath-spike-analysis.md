@@ -20,7 +20,7 @@ Snowflake (`DATA_ROOM.MONGODB.EXPORTS`, non-deleted XML HTTPExport): **19,442** 
 |---|---|
 | Why implemented this way? | Custom was built for large XML via streaming (`@celigo/parsers` XmlToJson). Streaming cannot evaluate real XPath; it does string-prefix matching on element paths. Automatic kept full XPath 1.0 via `xmldom-new` + `xpath`. |
 | Why does `//` not work on Custom? | `//` is a descendant axis. The streaming engine treats the path as a literal `/`-separated name. `//item` does not match `/data/item` in the stream, so `getNodes` returns empty. |
-| Impact if we support it? | Hybrid fallback: simple paths stay streaming; real XPath uses DOM. Memory for those paths matches Automatic (~25 MB XML → ~600 MB heap). Staged behind a flag. Production population at risk: **29** custom full-XPath docs. |
+| Impact if we support it? | Hybrid fallback: simple paths stay streaming; real XPath uses DOM. Memory for those paths matches Automatic (~25 MB XML → ~600 MB heap). Staged behind a flag. Production population at risk on **`resourcePath`**: **29** custom full-XPath docs. That 29 is `resourcePath` only (the empty-preview field). The ticket field `successPath` is a separate count: **32** custom + complex. Union of `resourcePath` / `successPath` / `failPath` on the same custom XML HTTPExport population: **62**. Lookups are in those numbers; HTTPImport custom XML is **0**. |
 
 ---
 
@@ -89,7 +89,7 @@ The two strategies share the same pipeline through `requestRobustly`. They diver
 | Area | Impact |
 |---|---|
 | Behavior (flag off) | None for Custom XPath (still empty). Scalar wrap (`count()` / `boolean()`) applies on DOM paths (Automatic); almost unused as `resourcePath`. `domRef` lazy-init crash fix is always on. |
-| Behavior (flag on) | **29** custom full-XPath exports/lookups start returning records instead of empty. Simple Custom paths unchanged. |
+| Behavior (flag on) | Custom + complex paths start returning nodes instead of empty. The **29** is `resourcePath` (21 export + 8 lookup). Same mechanism also covers `successPath` / `failPath` (32 custom + complex `successPath`; 62 docs have at least one of the three fields). Simple Custom paths unchanged. |
 | Memory / CPU | Only Custom + real XPath pays Automatic's DOM cost for that call. Simple Custom and Amazon SP do not. Large XML + `//` on Custom can spike heap the same way Automatic already can. |
 | JSON shape | Custom stays lean; we do not switch those 29 to Automatic's verbose shape. |
 | `resourceIdPath` on Custom import | Still not evaluated per record (pre-existing Custom contract). Out of scope. |
@@ -99,12 +99,16 @@ The two strategies share the same pipeline through `requestRobustly`. They diver
 
 - Teach streaming XmlToJson full XPath (large, wrong layer).
 - Force all Custom through DOM (would regress memory for the 231 simple-absolute Custom docs).
+- Emit a warning / `invalid_xpath` when Custom + non-simple path and the flag is **off**. That would fix the silent “0 Pages, 0 Records” symptom without the DOM cost, but it is a behavior change for the 29 (and the live Workday flow) while every environment is still flag-off. Rejected: keep flag-off = today’s empty result.
+- A body-size guard on the fallback path (refuse DOM above N MB). Not added. The flag is per-environment, not per-tenant: enabling production turns fallback on for every tenant on that adaptor. One large Custom XML + `//` can spike heap on a shared pod the same way Automatic already can. Default-off plus rare `//` is the control; watch heap after enable.
 
 The fallback would change behavior for **29** custom + full-XPath docs (21 export + 8 lookup) after the flag is on. That 29 is a **config population**, not 29 live flows:
 
 - **1 of 29** executed in the last 90 days (as of 2026-08-27).
 - **10 of 29** are attached to a non-deleted flow.
 - **1 of those 10 flows is enabled.** The other 9 attached flows are disabled. **19 of 29** are not on any live flow.
+
+Those 29 / 1-live-flow figures are `resourcePath` only. They are the right denominator for the silent empty-page bug. They are a lower bound for flag-on behavior change, which also includes `successPath` / `failPath` (see §5.5).
 
 ---
 
@@ -115,6 +119,8 @@ Filter: `deletedAt IS NULL`, `http.successMediaType = xml`, `adaptorType = HTTPE
 **Custom** = `parsers` contains `{ type: xml, version: 1 }`  
 Path field: `http.response.resourcePath`  
 Classification matches `isSimplePath` in `src/parsers/XmlParser.js`.
+
+Section 5.1–5.4 count **`http.response.resourcePath` only**. That is the field that yields silent `0 Pages, 0 Records`. The ticket title names **`successPath`** (“Path to success field in HTTP response body”). Empty `successPath` is not silent: `getNodes` empty → `HTTP_ADAPTOR_MS_RESPONSE_NO_PATH` and the request fails. Same `getNodes` / fallback. Counts for those fields and for imports are in §5.5.
 
 Total: **19,442** XML HTTPExport docs (exports + lookups).
 
@@ -143,9 +149,17 @@ Total: **19,442** XML HTTPExport docs (exports + lookups).
 | Full XPath: `@attr` | automatic | **1** | `/SubmitOrder/Order[@Id]` | **No** |
 | Full XPath: `@attr` | custom | **0** | — | — |
 
-**Custom + full XPath = 29** (27 `local-name()` + 2 `//`). That is the population the flag is for.
+**Custom + full XPath = 29** (27 `local-name()` + 2 `//`). That is the `resourcePath` population the flag is for.
 
 Flag **off** (default): none of these rows change in production except the latent `domRef` crash fix and rare Automatic `count()`/`boolean()` success-path wrapping.
+
+### 5.1a Relative paths (ticket title)
+
+The ticket asks about **relative xpath** and complex xpaths. Those are different cases.
+
+**Complex “relative”** (`//item`, `//Read/Projecttask`) is descendant XPath. Streaming cannot evaluate it. Two custom docs. Flag on → DOM. That is the product meaning of “relative” next to “complex.”
+
+**Simple relative** (`response/Read/Project`, 4 custom docs) stays on streaming. `formatSimplePath` prepends `/`, so Custom evaluates `/response/Read/Project`. Automatic evaluates the same string from the **document node** (first step = root element). They agree when the first segment is the root (`<response>…`). They both miss if that name is nested under a wrapper — Custom already misses today. Simple-relative never enters the DOM fallback. Preview of `response/Read/Project` is unchanged on both engines.
 
 ### 5.2 Custom + full XPath paths (the 29)
 
@@ -219,7 +233,20 @@ Mostly SOAP `local-name()` and `//` descendants. Almost no `text()` / `@attr` on
 | `text()` | ~16 |
 | `@attr` | ~2 |
 
-This inventory is **resourcePath only**. Success/fail paths are a separate field and were not counted here.
+### 5.5 `successPath` / `failPath` / imports (same Snowflake filters, 2026-08-28)
+
+Custom XML HTTPExport (`DATA_ROOM` / `SILVER.MONGODB.EXPORTS`, non-deleted, `successMediaType = xml`):
+
+| Field | Custom + complex XPath |
+|---|---:|
+| `resourcePath` (tables above) | **29** |
+| `successPath` (ticket field) | **32** |
+| `failPath` | **19** |
+| Any of the three | **62** |
+
+HTTPImport (`SILVER.MONGODB.IMPORTS`, same XML filter): **9,360** XML imports, **0** with a custom XML parser (`version = 1`). The fallback can run in `processSubmitResponse`; there is no current custom-import population for it to change. Lookups were already in the export table.
+
+Job/flow attachment was not re-run on the extra 33 (`successPath`/`failPath`-only) docs. The 1-of-29 live figure is `resourcePath` only.
 
 ---
 
@@ -252,4 +279,4 @@ Also re-run Automatic vs Custom on the same payload (shape still differs: verbos
 - Flag: `XML_CUSTOM_PARSER_XPATH_FALLBACK_ENABLED` in `env.yaml` (`devops_configured: true`)
 - Decision record in http-adaptor: `docs/decisions/2026-08-26-xml-custom-parser-xpath-hybrid-fallback.md`
 
-Rollout: merge with flag unset → enable on QA → confirm `//item` / `local-name()` → enable production. Watch heap on XML-heavy Custom + XPath flows after enable. The only live production flow in the 29 today is Workday employee terminations (SOAP `local-name()` Worker path).
+Rollout: merge with flag unset → enable on QA → confirm `//item` / `local-name()` → enable production. Watch heap on XML-heavy Custom + XPath flows after enable. The flag is per-environment: production enable is every tenant on that adaptor at once. No body-size cap on the fallback (see §4). The only live `resourcePath` flow in the 29 today is Workday employee terminations (SOAP `local-name()` Worker path).
