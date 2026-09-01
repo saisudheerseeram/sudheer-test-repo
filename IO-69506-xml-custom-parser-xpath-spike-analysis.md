@@ -39,7 +39,7 @@ Amazon SP (`simpleXpathsOnly`) always stays on streaming, even after this change
 2. **Custom JSON shape.** Custom configs (`listNodes`, `includePaths`, `excludePaths`, lean JSON) live in the streaming parser. Automatic emits verbose `{ Name: [{ _: 'John' }] }`. Custom emits `{ Name: 'John' }`.
 3. **UI mismatch.** The resource-path field is labeled "XPath" for both strategies. Automatic honors XPath. Custom only honors a subset that *looks* like XPath (`/a/b/c`). Users switching Automatic → Custom with `//item` see empty preview and empty export pages — the IO-69506 repro.
 
-Related history: IO-30688, IO-29907, IO-28911, IO-45527, IO-45554, PRODUCT-1391.
+Related history: [IO-30688](https://celigo.atlassian.net/browse/IO-30688), [IO-29907](https://celigo.atlassian.net/browse/IO-29907), [IO-28911](https://celigo.atlassian.net/browse/IO-28911), [IO-45527](https://celigo.atlassian.net/browse/IO-45527), [IO-45554](https://celigo.atlassian.net/browse/IO-45554), [PRODUCT-1391](https://celigo.atlassian.net/browse/PRODUCT-1391).
 
 ---
 
@@ -280,3 +280,17 @@ Also re-run Automatic vs Custom on the same payload (shape still differs: verbos
 - Decision record in http-adaptor: `docs/decisions/2026-08-26-xml-custom-parser-xpath-hybrid-fallback.md`
 
 Rollout: merge with flag unset → enable on QA → confirm `//item` / `local-name()` → enable production. Watch heap on XML-heavy Custom + XPath flows after enable. The flag is per-environment: production enable is every tenant on that adaptor at once. No body-size cap on the fallback (see §4). The only live `resourcePath` flow in the 29 today is Workday employee terminations (SOAP `local-name()` Worker path).
+
+---
+
+## 8. Final summary
+
+Custom was implemented for **large XML**. It uses a **streaming** engine (`XmlToJson`) and does not load the full document into a DOM.
+
+Automatic uses **DOM** (`xmldom-new` + `xpath`): the complete response payload is parsed into memory so full XPath 1.0 works.
+
+**Suggested PR:** [celigo/http-adaptor#1975](https://github.com/celigo/http-adaptor/pull/1975) — hybrid fallback. Simple Custom paths stay streaming. Real XPath on Custom takes the Automatic path for that call: the complete body is loaded into memory.
+
+Current XML export payloads we are seeing are at most **~500 KB**. At that size the fallback will not OOM. If a Custom + complex-XPath payload is huge, the PR loads the complete document into memory and **can OOM** (documented worst case: ~25 MB XML → ~600 MB heap).
+
+Related history: [IO-30688](https://celigo.atlassian.net/browse/IO-30688), [IO-29907](https://celigo.atlassian.net/browse/IO-29907), [IO-28911](https://celigo.atlassian.net/browse/IO-28911), [IO-45527](https://celigo.atlassian.net/browse/IO-45527), [IO-45554](https://celigo.atlassian.net/browse/IO-45554), [PRODUCT-1391](https://celigo.atlassian.net/browse/PRODUCT-1391).
